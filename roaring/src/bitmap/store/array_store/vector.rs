@@ -4,9 +4,17 @@
 //! Prior work: Schlegel et al., Fast Sorted-Set Intersection using SIMD Instructions
 //!
 //! Rust port notes:
+//! The algorithms operate on the native vector width of the SIMD level (`Simd::u16s`): 8 lanes for
+//! 128-bit SIMD, 16 lanes for AVX2 and 32 lanes for AVX-512. Every level is made of 128-bit blocks
+//! of 8 lanes, which some operations work on independently.
+//!
 //! Like CRoaring, the intersection and difference use the x86 PCMPISTRM instruction (falling back
-//! to PCMPESTRM while a zero may be present) where SSE4.2 is available. Other SIMD levels use a
-//! portable all-pairs comparison (see `matrix_cmp_u16`) instead.
+//! to PCMPESTRM while a zero may be present) on each pair of 128-bit blocks where SSE4.2 is
+//! available, up to AVX2. Other SIMD levels use a portable all-pairs comparison (see
+//! `matrix_cmp_u16`) instead.
+//!
+//! The union and symmetric difference merge vectors with a bitonic merge network, which takes
+//! `log2(N)` steps for `N` lanes.
 //!
 //! The public functions select a SIMD level at runtime with `fearless_simd::dispatch!`, and call
 //! implementations generic over the SIMD level. Those are annotated with `#[simd]`, so that they
@@ -21,11 +29,32 @@
 use super::scalar;
 use crate::bitmap::store::array_store::visitor::BinaryOperationVisitor;
 use fearless_simd::prelude::*;
-use fearless_simd::{dispatch, mask16x8, u16x8, Level};
+use fearless_simd::{dispatch, u16x8, Level};
 use fearless_simd_macros::simd;
 
-/// The number of lanes in a `u16x8`
-const LANES: usize = 8;
+/// A native-width vector of `u16`s
+pub type U16s<S> = <S as Simd>::u16s;
+/// A native-width mask of 16 bit lanes
+type Mask16s<S> = <S as Simd>::mask16s;
+/// A native-width vector of `u8`s
+type U8s<S> = <S as Simd>::u8s;
+
+/// The number of lanes in a block of a vector (a `u16x8`)
+const BLOCK_LANES: usize = 8;
+/// The largest number of lanes in a `U16s` (a `u16x32` for AVX-512), used to size buffers
+pub const MAX_LANES: usize = 32;
+
+/// The number of lanes in a `U16s<S>`
+#[inline(always)]
+pub fn lanes<S: Simd>() -> usize {
+    <U16s<S> as SimdBase<S>>::LEN
+}
+
+/// A bitmask with a bit set for every lane of a `U16s<S>`
+#[inline(always)]
+fn lanes_bitmask<S: Simd>() -> u64 {
+    u64::MAX >> (64 - lanes::<S>())
+}
 
 /// The SIMD level to use.
 ///
@@ -65,60 +94,60 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
     // returns `new`, with a mask of its values which were not already written,
     // assuming that the previously written vector was `old`
     #[inline(always)]
-    fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
-        // `[old[7], new[0], ..., new[6]]`
-        let tmp: u16x8<S> = old.slide::<7>(new);
-        let mask = !(tmp.simd_eq(new).to_bitmask() as u8);
+    fn handle_vector<S: Simd>(old: U16s<S>, new: U16s<S>) -> (U16s<S>, u64) {
+        let tmp: U16s<S> = shift_in_1::<S>(old, new);
+        let mask = !tmp.simd_eq(new).to_bitmask() & lanes_bitmask::<S>();
         (new, mask)
     }
 
-    if (lhs.len() < 8) || (rhs.len() < 8) {
+    let n = lanes::<S>();
+    if (lhs.len() < n) || (rhs.len() < n) {
         scalar::or(lhs, rhs, visitor);
         return;
     }
 
-    let len1: usize = lhs.len() / 8;
-    let len2: usize = rhs.len() / 8;
+    let len1: usize = lhs.len() / n;
+    let len2: usize = rhs.len() / n;
 
-    let v_a: u16x8<S> = load(simd, lhs);
-    let v_b: u16x8<S> = load(simd, rhs);
-    let [mut v_min, mut v_max] = simd_merge_u16(v_a, v_b);
+    let v_a: U16s<S> = load(simd, lhs);
+    let v_b: U16s<S> = load(simd, rhs);
+    let [mut v_min, mut v_max] = simd_merge_u16::<S>(v_a, v_b);
 
     let mut i = 1;
     let mut j = 1;
-    let (v, m) = handle_vector(u16x8::splat(simd, u16::MAX), v_min);
-    visitor.visit_vector(v, m);
-    let mut v_prev: u16x8<S> = v_min;
+    let (v, m) = handle_vector::<S>(U16s::<S>::splat(simd, u16::MAX), v_min);
+    visitor.visit_vector::<S>(v, m);
+    let mut v_prev: U16s<S> = v_min;
     if (i < len1) && (j < len2) {
-        let mut v: u16x8<S>;
-        let mut cur_a: u16 = lhs[8 * i];
-        let mut cur_b: u16 = rhs[8 * j];
+        let mut v: U16s<S>;
+        let mut cur_a: u16 = lhs[n * i];
+        let mut cur_b: u16 = rhs[n * j];
         loop {
             if cur_a <= cur_b {
-                v = load(simd, &lhs[8 * i..]);
+                v = load(simd, &lhs[n * i..]);
                 i += 1;
                 if i < len1 {
-                    cur_a = lhs[8 * i];
+                    cur_a = lhs[n * i];
                 } else {
                     break;
                 }
             } else {
-                v = load(simd, &rhs[8 * j..]);
+                v = load(simd, &rhs[n * j..]);
                 j += 1;
                 if j < len2 {
-                    cur_b = rhs[8 * j];
+                    cur_b = rhs[n * j];
                 } else {
                     break;
                 }
             }
-            [v_min, v_max] = simd_merge_u16(v, v_max);
-            let (v, m) = handle_vector(v_prev, v_min);
-            visitor.visit_vector(v, m);
+            [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
+            let (v, m) = handle_vector::<S>(v_prev, v_min);
+            visitor.visit_vector::<S>(v, m);
             v_prev = v_min;
         }
-        [v_min, v_max] = simd_merge_u16(v, v_max);
-        let (v, m) = handle_vector(v_prev, v_min);
-        visitor.visit_vector(v, m);
+        [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
+        let (v, m) = handle_vector::<S>(v_prev, v_min);
+        visitor.visit_vector::<S>(v, m);
         v_prev = v_min;
     }
 
@@ -128,15 +157,14 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
     // could be improved?
     //
     // copy the small end on a tmp buffer
-    let mut buffer: [u16; 16] = [0; 16];
-    let (v, m) = handle_vector(v_prev, v_max);
-    store(swizzle_to_front(v, m), buffer.as_mut_slice());
-    let mut rem = m.count_ones() as usize;
+    let mut buffer: [u16; 2 * MAX_LANES] = [0; 2 * MAX_LANES];
+    let (v, m) = handle_vector::<S>(v_prev, v_max);
+    let mut rem = compress_into::<S>(v, m, &mut buffer);
 
     let (tail_a, tail_b, tail_len) = if i == len1 {
-        (&lhs[8 * i..], &rhs[8 * j..], lhs.len() - 8 * len1)
+        (&lhs[n * i..], &rhs[n * j..], lhs.len() - n * len1)
     } else {
-        (&rhs[8 * j..], &lhs[8 * i..], rhs.len() - 8 * len2)
+        (&rhs[n * j..], &lhs[n * i..], rhs.len() - n * len2)
     };
 
     buffer[rem..rem + tail_len].copy_from_slice(tail_a);
@@ -157,29 +185,31 @@ pub fn and(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) 
 
 #[simd]
 fn and_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
-    let st_a = (lhs.len() / LANES) * LANES;
-    let st_b = (rhs.len() / LANES) * LANES;
+    let n = lanes::<S>();
+    let st_a = (lhs.len() / n) * n;
+    let st_b = (rhs.len() / n) * n;
 
     let mut i: usize = 0;
     let mut j: usize = 0;
     if (i < st_a) && (j < st_b) {
-        let mut v_a: u16x8<S> = load(simd, &lhs[i..]);
-        let mut v_b: u16x8<S> = load(simd, &rhs[j..]);
+        let mut v_a: U16s<S> = load(simd, &lhs[i..]);
+        let mut v_b: U16s<S> = load(simd, &rhs[j..]);
         loop {
-            let mask = matrix_cmp_bitmask(v_a, v_b, lhs[i] == 0 || rhs[j] == 0);
-            visitor.visit_vector(v_a, mask);
+            let may_contain_zero = lhs[i] == 0 || rhs[j] == 0;
+            let mask = matrix_cmp_bitmask::<S>(v_a, v_b, &lhs[i..], &rhs[j..], may_contain_zero);
+            visitor.visit_vector::<S>(v_a, mask);
 
-            let a_max: u16 = lhs[i + LANES - 1];
-            let b_max: u16 = rhs[j + LANES - 1];
+            let a_max: u16 = lhs[i + n - 1];
+            let b_max: u16 = rhs[j + n - 1];
             if a_max <= b_max {
-                i += LANES;
+                i += n;
                 if i == st_a {
                     break;
                 }
                 v_a = load(simd, &lhs[i..]);
             }
             if b_max <= a_max {
-                j += LANES;
+                j += n;
                 if j == st_b {
                     break;
                 }
@@ -219,65 +249,64 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     // returns the vector to write, and a mask of the values to write from it,
     // omitting repeated values assuming that previously written vector was "old"
     #[inline(always)]
-    fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
-        // `[old[6], old[7], new[0], ..., new[5]]`
-        let tmp1: u16x8<S> = old.slide::<6>(new);
-        // `[old[7], new[0], ..., new[6]]`
-        let tmp2: u16x8<S> = old.slide::<7>(new);
-        let eq_l: mask16x8<S> = tmp2.simd_eq(tmp1);
-        let eq_r: mask16x8<S> = tmp2.simd_eq(new);
-        let eq_l_or_r: mask16x8<S> = eq_l | eq_r;
-        let mask: u8 = eq_l_or_r.to_bitmask() as u8;
-        (tmp2, !mask)
+    fn handle_vector<S: Simd>(old: U16s<S>, new: U16s<S>) -> (U16s<S>, u64) {
+        let tmp1: U16s<S> = shift_in_2::<S>(old, new);
+        let tmp2: U16s<S> = shift_in_1::<S>(old, new);
+        let eq_l: Mask16s<S> = tmp2.simd_eq(tmp1);
+        let eq_r: Mask16s<S> = tmp2.simd_eq(new);
+        let eq_l_or_r: Mask16s<S> = eq_l | eq_r;
+        let mask: u64 = eq_l_or_r.to_bitmask();
+        (tmp2, !mask & lanes_bitmask::<S>())
     }
 
-    if (lhs.len() < 8) || (rhs.len() < 8) {
+    let n = lanes::<S>();
+    if (lhs.len() < n) || (rhs.len() < n) {
         scalar::xor(lhs, rhs, visitor);
         return;
     }
 
-    let len1: usize = lhs.len() / 8;
-    let len2: usize = rhs.len() / 8;
+    let len1: usize = lhs.len() / n;
+    let len2: usize = rhs.len() / n;
 
-    let v_a: u16x8<S> = load(simd, lhs);
-    let v_b: u16x8<S> = load(simd, rhs);
-    let [mut v_min, mut v_max] = simd_merge_u16(v_a, v_b);
+    let v_a: U16s<S> = load(simd, lhs);
+    let v_b: U16s<S> = load(simd, rhs);
+    let [mut v_min, mut v_max] = simd_merge_u16::<S>(v_a, v_b);
 
     let mut i = 1;
     let mut j = 1;
-    let (v, m) = handle_vector(u16x8::splat(simd, u16::MAX), v_min);
-    visitor.visit_vector(v, m);
-    let mut v_prev: u16x8<S> = v_min;
+    let (v, m) = handle_vector::<S>(U16s::<S>::splat(simd, u16::MAX), v_min);
+    visitor.visit_vector::<S>(v, m);
+    let mut v_prev: U16s<S> = v_min;
     if (i < len1) && (j < len2) {
-        let mut v: u16x8<S>;
-        let mut cur_a: u16 = lhs[8 * i];
-        let mut cur_b: u16 = rhs[8 * j];
+        let mut v: U16s<S>;
+        let mut cur_a: u16 = lhs[n * i];
+        let mut cur_b: u16 = rhs[n * j];
         loop {
             if cur_a <= cur_b {
-                v = load(simd, &lhs[8 * i..]);
+                v = load(simd, &lhs[n * i..]);
                 i += 1;
                 if i < len1 {
-                    cur_a = lhs[8 * i];
+                    cur_a = lhs[n * i];
                 } else {
                     break;
                 }
             } else {
-                v = load(simd, &rhs[8 * j..]);
+                v = load(simd, &rhs[n * j..]);
                 j += 1;
                 if j < len2 {
-                    cur_b = rhs[8 * j];
+                    cur_b = rhs[n * j];
                 } else {
                     break;
                 }
             }
-            [v_min, v_max] = simd_merge_u16(v, v_max);
-            let (v, m) = handle_vector(v_prev, v_min);
-            visitor.visit_vector(v, m);
+            [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
+            let (v, m) = handle_vector::<S>(v_prev, v_min);
+            visitor.visit_vector::<S>(v, m);
             v_prev = v_min;
         }
-        [v_min, v_max] = simd_merge_u16(v, v_max);
-        let (v, m) = handle_vector(v_prev, v_min);
-        visitor.visit_vector(v, m);
+        [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
+        let (v, m) = handle_vector::<S>(v_prev, v_min);
+        visitor.visit_vector::<S>(v, m);
         v_prev = v_min;
     }
 
@@ -287,27 +316,26 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     // could be improved?
     // conditionally stores the last value of laststore as well as all but the
     // last value of vecMax,
-    let mut buffer: [u16; 17] = [0; 17];
+    let mut buffer: [u16; 2 * MAX_LANES + 1] = [0; 2 * MAX_LANES + 1];
     // remaining size
-    let (v, m) = handle_vector(v_prev, v_max);
-    store(swizzle_to_front(v, m), buffer.as_mut_slice());
-    let mut rem = m.count_ones() as usize;
+    let (v, m) = handle_vector::<S>(v_prev, v_max);
+    let mut rem = compress_into::<S>(v, m, &mut buffer);
 
     // Store `v_max` rather than reading its lanes with `as_array()`, which makes LLVM split
     // `v_max` into pieces in the merge loop above
-    let mut arr_max = [0u16; LANES];
-    store(v_max, &mut arr_max);
-    let vec7 = arr_max[7];
-    let vec6 = arr_max[6];
-    if vec6 != vec7 {
-        buffer[rem] = vec7;
+    let mut arr_max = [0u16; MAX_LANES];
+    store::<S>(v_max, &mut arr_max);
+    let vec_last = arr_max[n - 1];
+    let vec_second_last = arr_max[n - 2];
+    if vec_second_last != vec_last {
+        buffer[rem] = vec_last;
         rem += 1;
     }
 
     let (tail_a, tail_b, tail_len) = if i == len1 {
-        (&lhs[8 * i..], &rhs[8 * j..], lhs.len() - 8 * len1)
+        (&lhs[n * i..], &rhs[n * j..], lhs.len() - n * len1)
     } else {
-        (&rhs[8 * j..], &lhs[8 * i..], rhs.len() - 8 * len2)
+        (&rhs[n * j..], &lhs[n * i..], rhs.len() - n * len2)
     };
 
     buffer[rem..rem + tail_len].copy_from_slice(tail_a);
@@ -336,32 +364,36 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
         return;
     }
 
-    let st_a = (lhs.len() / LANES) * LANES;
-    let st_b = (rhs.len() / LANES) * LANES;
+    let n = lanes::<S>();
+    let st_a = (lhs.len() / n) * n;
+    let st_b = (rhs.len() / n) * n;
 
     let mut i = 0;
     let mut j = 0;
     if (i < st_a) && (j < st_b) {
-        let mut v_a: u16x8<S> = load(simd, &lhs[i..]);
-        let mut v_b: u16x8<S> = load(simd, &rhs[j..]);
+        let mut v_a: U16s<S> = load(simd, &lhs[i..]);
+        let mut v_b: U16s<S> = load(simd, &rhs[j..]);
         // we have a running mask which indicates which values from a have been
         // spotted in b, these don't get written out.
-        let mut runningmask_a_found_in_b: u8 = 0;
+        let mut runningmask_a_found_in_b: u64 = 0;
         loop {
             // a_found_in_b will contain a mask indicate for each entry in A
             // whether it is seen in B
-            let a_found_in_b: u8 = matrix_cmp_bitmask(v_a, v_b, lhs[i] == 0 || rhs[j] == 0);
+            let may_contain_zero = lhs[i] == 0 || rhs[j] == 0;
+            let a_found_in_b: u64 =
+                matrix_cmp_bitmask::<S>(v_a, v_b, &lhs[i..], &rhs[j..], may_contain_zero);
             runningmask_a_found_in_b |= a_found_in_b;
             // we always compare the last values of A and B
-            let a_max: u16 = lhs[i + LANES - 1];
-            let b_max: u16 = rhs[j + LANES - 1];
+            let a_max: u16 = lhs[i + n - 1];
+            let b_max: u16 = rhs[j + n - 1];
             if a_max <= b_max {
                 // Ok. In this code path, we are ready to write our v_a
                 // because there is no need to read more from B, they will
                 // all be large values.
-                let bitmask_belongs_to_difference = !runningmask_a_found_in_b;
-                visitor.visit_vector(v_a, bitmask_belongs_to_difference);
-                i += LANES;
+                let bitmask_belongs_to_difference =
+                    !runningmask_a_found_in_b & lanes_bitmask::<S>();
+                visitor.visit_vector::<S>(v_a, bitmask_belongs_to_difference);
+                i += n;
                 if i == st_a {
                     break;
                 }
@@ -370,7 +402,7 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
             }
             if b_max <= a_max {
                 // in this code path, the current v_b has become useless
-                j += LANES;
+                j += n;
                 if j == st_b {
                     break;
                 }
@@ -387,24 +419,28 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
         if i < st_a {
             let remaining_rhs = &rhs[j..];
             if !remaining_rhs.is_empty() {
-                let mut buffer: [u16; 8] = [0; 8]; // buffer to do a masked load
+                // buffer to do a masked load
+                let mut buffer: [u16; MAX_LANES] = [0; MAX_LANES];
+                let buffer = &mut buffer[..n];
                 buffer[..remaining_rhs.len()].copy_from_slice(remaining_rhs);
                 // Ensure the buffer is filled with a value we should remove: we do not want to
                 // end up trying to remove zero values which aren't actually in rhs
                 buffer[remaining_rhs.len()..].fill(remaining_rhs[0]);
-                v_b = load(simd, &buffer);
+                v_b = load(simd, buffer);
                 let may_contain_zero = lhs[i] == 0 || remaining_rhs[0] == 0;
-                let a_found_in_b: u8 = matrix_cmp_bitmask(v_a, v_b, may_contain_zero);
+                let a_found_in_b: u64 =
+                    matrix_cmp_bitmask::<S>(v_a, v_b, &lhs[i..], buffer, may_contain_zero);
                 runningmask_a_found_in_b |= a_found_in_b;
                 // Read from `lhs` (which `v_a` was loaded from): reading a lane of `v_a` makes LLVM
                 // split `v_a` into pieces in the loop above
-                let max_va = lhs[i + LANES - 1];
+                let max_va = lhs[i + n - 1];
                 let used_rhs = remaining_rhs.partition_point(|&b| b <= max_va);
                 j += used_rhs;
             }
-            let bitmask_belongs_to_difference: u8 = !runningmask_a_found_in_b;
-            visitor.visit_vector(v_a, bitmask_belongs_to_difference);
-            i += LANES;
+            let bitmask_belongs_to_difference: u64 =
+                !runningmask_a_found_in_b & lanes_bitmask::<S>();
+            visitor.visit_vector::<S>(v_a, bitmask_belongs_to_difference);
+            i += n;
         }
     }
 
@@ -412,22 +448,46 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     scalar::sub(&lhs[i..], &rhs[j..], visitor);
 }
 
-/// load the first `LANES` values of `src`
+/// load the first `lanes::<S>()` values of `src`
 ///
 /// ### Panics
-///   - If `src` is shorter than `LANES`
+///   - If `src` is shorter than `lanes::<S>()`
 #[inline(always)]
-fn load<S: Simd>(simd: S, src: &[u16]) -> u16x8<S> {
-    u16x8::from_slice(simd, &src[..LANES])
+fn load<S: Simd>(simd: S, src: &[u16]) -> U16s<S> {
+    U16s::<S>::from_slice(simd, &src[..lanes::<S>()])
 }
 
-/// write `v` to the first `LANES` values of `out`
+/// write `v` to the first `lanes::<S>()` values of `out`
 ///
 /// ### Panics
-///   - If `out` is shorter than `LANES`
+///   - If `out` is shorter than `lanes::<S>()`
 #[inline(always)]
-fn store<S: Simd>(v: u16x8<S>, out: &mut [u16]) {
-    v.store_slice(&mut out[..LANES])
+fn store<S: Simd>(v: U16s<S>, out: &mut [u16]) {
+    v.store_slice(&mut out[..lanes::<S>()])
+}
+
+/// `[old[N - 1], new[0], ..., new[N - 2]]`, where `N` is the number of lanes
+#[inline(always)]
+fn shift_in_1<S: Simd>(old: U16s<S>, new: U16s<S>) -> U16s<S> {
+    // `slide` takes the shift (`N - 1`) as a const generic, so match on the
+    // number of lanes, which is known at compile time
+    match lanes::<S>() {
+        8 => old.slide::<7>(new),
+        16 => old.slide::<15>(new),
+        32 => old.slide::<31>(new),
+        _ => unreachable!(),
+    }
+}
+
+/// `[old[N - 2], old[N - 1], new[0], ..., new[N - 3]]`, where `N` is the number of lanes
+#[inline(always)]
+fn shift_in_2<S: Simd>(old: U16s<S>, new: U16s<S>) -> U16s<S> {
+    match lanes::<S>() {
+        8 => old.slide::<6>(new),
+        16 => old.slide::<14>(new),
+        32 => old.slide::<30>(new),
+        _ => unreachable!(),
+    }
 }
 
 /// Compare all lanes in `a` to all lanes in `b`
@@ -442,79 +502,200 @@ fn store<S: Simd>(v: u16x8<S>, out: &mut [u16]) {
 /// assert_eq!(result.to_bitmask(), 0b0000_1010);
 /// ```
 #[inline(always)]
-fn matrix_cmp_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> mask16x8<S> {
-    a.simd_eq(b)
-        | a.simd_eq(b.rotate_elements_left::<1>())
-        | a.simd_eq(b.rotate_elements_left::<2>())
-        | a.simd_eq(b.rotate_elements_left::<3>())
-        | a.simd_eq(b.rotate_elements_left::<4>())
-        | a.simd_eq(b.rotate_elements_left::<5>())
-        | a.simd_eq(b.rotate_elements_left::<6>())
-        | a.simd_eq(b.rotate_elements_left::<7>())
+fn matrix_cmp_u16<S: Simd>(a: U16s<S>, b: U16s<S>) -> Mask16s<S> {
+    // Compare `a` to every rotation of each 128-bit block of `b`
+    #[inline(always)]
+    fn cmp_rotations_within_blocks<S: Simd>(a: U16s<S>, b: U16s<S>) -> Mask16s<S> {
+        a.simd_eq(b)
+            | a.simd_eq(b.slide_within_blocks::<1>(b))
+            | a.simd_eq(b.slide_within_blocks::<2>(b))
+            | a.simd_eq(b.slide_within_blocks::<3>(b))
+            | a.simd_eq(b.slide_within_blocks::<4>(b))
+            | a.simd_eq(b.slide_within_blocks::<5>(b))
+            | a.simd_eq(b.slide_within_blocks::<6>(b))
+            | a.simd_eq(b.slide_within_blocks::<7>(b))
+    }
+
+    // ...then rotate the blocks of `b`, so every block of `a` meets every block of `b`
+    let mut found = cmp_rotations_within_blocks::<S>(a, b);
+    let mut b = b;
+    for _ in 1..lanes::<S>() / BLOCK_LANES {
+        b = b.rotate_elements_left::<BLOCK_LANES>();
+        found |= cmp_rotations_within_blocks::<S>(a, b);
+    }
+    found
 }
 
 /// Like [`matrix_cmp_u16`], but returns the mask as a bitmask, with bit `i` set if `a[i]` is in `b`
 ///
+/// `a_src` and `b_src` must start with the values `a` and `b` were loaded from.
+///
 /// `may_contain_zero` must be true if either vector may contain a zero lane: because the vectors
 /// come from sorted arrays, that can only be the first lane of the first vector of either array.
 ///
-/// Uses the SSE4.2 PCMPISTRM instruction where it is available, falling back to the slower
-/// PCMPESTRM when there may be a zero (which PCMPISTRM treats as the end of the string).
+/// Uses the SSE4.2 PCMPISTRM instruction for 128-bit vectors where it is available, falling back
+/// to the slower PCMPESTRM when there may be a zero (which PCMPISTRM treats as the end of the
+/// string).
 #[inline(always)]
-fn matrix_cmp_bitmask<S: Simd>(a: u16x8<S>, b: u16x8<S>, may_contain_zero: bool) -> u8 {
+fn matrix_cmp_bitmask<S: Simd>(
+    a: U16s<S>,
+    b: U16s<S>,
+    a_src: &[u16],
+    b_src: &[u16],
+    may_contain_zero: bool,
+) -> u64 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(sse4_2) = a.token().level().as_sse4_2() {
-        return x86::matrix_cmp_bitmask(sse4_2, a.into(), b.into(), may_contain_zero);
+    if lanes::<S>() <= 2 * BLOCK_LANES {
+        if let Some(sse4_2) = a.token().level().as_sse4_2() {
+            return x86::matrix_cmp_bitmask(sse4_2, a_src, b_src, lanes::<S>(), may_contain_zero);
+        }
     }
-    let _ = may_contain_zero;
-    matrix_cmp_u16(a, b).to_bitmask() as u8
+    let _ = (a_src, b_src, may_contain_zero);
+    matrix_cmp_u16::<S>(a, b).to_bitmask()
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86 {
+    use super::BLOCK_LANES;
     #[cfg(target_arch = "x86")]
     use core::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
+    use fearless_simd::{prelude::*, u16x8};
 
     fearless_simd::kernel!(
-        /// Returns a bitmask with bit `i` set if lane `i` of `a` is equal to any lane of `b`
+        /// Returns a bitmask with bit `i` set if `a[i]` is equal to any of the first `lanes`
+        /// values of `b`, for the first `lanes` values of `a`, comparing each pair of 8 lane
+        /// blocks
         #[inline]
         pub(super) fn matrix_cmp_bitmask(
             sse4_2: Sse4_2,
-            a: __m128i,
-            b: __m128i,
+            a: &[u16],
+            b: &[u16],
+            lanes: usize,
             may_contain_zero: bool,
-        ) -> u8 {
+        ) -> u64 {
             const MODE: i32 = _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK;
-            let found = if may_contain_zero {
-                _mm_cmpestrm::<MODE>(b, 8, a, 8)
-            } else {
-                _mm_cmpistrm::<MODE>(b, a)
-            };
-            _mm_cvtsi128_si32(found) as u8
+            let mut found = 0;
+            for (i, a) in a[..lanes].chunks_exact(BLOCK_LANES).enumerate() {
+                let a: __m128i = u16x8::from_slice(sse4_2, a).into();
+                let mut block_found = _mm_setzero_si128();
+                for b in b[..lanes].chunks_exact(BLOCK_LANES) {
+                    let b: __m128i = u16x8::from_slice(sse4_2, b).into();
+                    let in_b = if may_contain_zero {
+                        _mm_cmpestrm::<MODE>(b, 8, a, 8)
+                    } else {
+                        _mm_cmpistrm::<MODE>(b, a)
+                    };
+                    block_found = _mm_or_si128(block_found, in_b);
+                }
+                found |= (_mm_cvtsi128_si32(block_found) as u8 as u64) << (i * BLOCK_LANES);
+            }
+            found
         }
     );
 }
 
 /// Assuming that a and b are sorted, returns an array of the sorted output.
-/// Developed originally for merge sort using SIMD instructions.
-/// Standard merge. See, e.g., Inoue and Taura, SIMD- and Cache-Friendly
-/// Algorithm for Sorting an Array of Structures
+///
+/// Uses a bitonic merge network: reversing `b` makes `a` followed by `b` a bitonic sequence, so
+/// the lane-wise min and max of `a` and reversed `b` are two bitonic sequences, with every value
+/// of the min <= every value of the max. Each is then sorted in `log2(N)` steps.
 #[inline(always)]
-fn simd_merge_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> [u16x8<S>; 2] {
-    let mut tmp: u16x8<S> = a.min(b);
-    let mut max: u16x8<S> = a.max(b);
-    tmp = tmp.rotate_elements_left::<1>();
-    let mut min: u16x8<S> = tmp.min(max);
-    for _ in 0..6 {
-        max = tmp.max(max);
-        tmp = min.rotate_elements_left::<1>();
-        min = tmp.min(max);
+fn simd_merge_u16<S: Simd>(a: U16s<S>, b: U16s<S>) -> [U16s<S>; 2] {
+    let b = b.reverse();
+    [sort_bitonic::<S>(a.min(b)), sort_bitonic::<S>(a.max(b))]
+}
+
+/// Sorts a bitonic sequence (one which increases then decreases, or vice versa)
+#[inline(always)]
+fn sort_bitonic<S: Simd>(mut v: U16s<S>) -> U16s<S> {
+    let mut distance = lanes::<S>() / 2;
+    while distance > 0 {
+        // Compare each lane to the lane `distance` away, in groups of `2 * distance` lanes,
+        // keeping the min in the lower lane and the max in the upper lane
+        let partner = swap_lanes::<S>(v, distance);
+        let lower = Mask16s::<S>::from_bitmask(v.token(), lower_lanes_bitmask(distance));
+        v = lower.select(v.min(partner), v.max(partner));
+        distance /= 2;
     }
-    max = tmp.max(max);
-    min = min.rotate_elements_left::<1>();
-    [min, max]
+    v
+}
+
+/// A bitmask of the lanes `i` where `i & distance == 0`, for a power of two `distance`
+#[inline(always)]
+fn lower_lanes_bitmask(distance: usize) -> u64 {
+    match distance {
+        1 => 0x5555_5555_5555_5555,
+        2 => 0x3333_3333_3333_3333,
+        4 => 0x0F0F_0F0F_0F0F_0F0F,
+        8 => 0x00FF_00FF_00FF_00FF,
+        16 => 0x0000_FFFF_0000_FFFF,
+        _ => unreachable!(),
+    }
+}
+
+/// Swaps each lane `i` of `v` with lane `i ^ distance`, for a power of two `distance`
+#[inline(always)]
+fn swap_lanes<S: Simd>(v: U16s<S>, distance: usize) -> U16s<S> {
+    let simd = v.token();
+    let n = lanes::<S>();
+    if distance < BLOCK_LANES {
+        // Within each block: swizzle the two bytes of each lane, with indices relative to the block
+        let indices = U8s::<S>::from_fn(simd, |byte| {
+            let lane = (byte / 2) % BLOCK_LANES;
+            ((lane ^ distance) * 2 + byte % 2) as u8
+        });
+        v.swizzle_dyn_within_blocks(indices)
+    } else if 2 * distance == n {
+        // Swap the two halves
+        match distance {
+            8 => v.rotate_elements_left::<8>(),
+            16 => v.rotate_elements_left::<16>(),
+            _ => unreachable!(),
+        }
+    } else {
+        let indices = U8s::<S>::from_fn(simd, |byte| {
+            let lane = byte / 2;
+            ((lane ^ distance) * 2 + byte % 2) as u8
+        });
+        v.swizzle_dyn(indices)
+    }
+}
+
+/// Calls `f` for each 128-bit block of `v` in order, with the values of the block selected by the
+/// corresponding byte of `mask` moved to the front, and the number of selected values
+#[inline(always)]
+pub fn for_each_compressed_block<S: Simd>(
+    v: U16s<S>,
+    mask: u64,
+    mut f: impl FnMut(u16x8<S>, usize),
+) {
+    let mut values = [0u16; MAX_LANES];
+    let values = &mut values[..lanes::<S>()];
+    v.store_slice(values);
+    for (i, block) in values.chunks_exact(BLOCK_LANES).enumerate() {
+        let block_mask = (mask >> (i * BLOCK_LANES)) as u8;
+        let block = u16x8::from_slice(v.token(), block);
+        f(swizzle_to_front(block, block_mask), block_mask.count_ones() as usize);
+    }
+}
+
+/// Writes the values of `v` selected by `mask` to the front of `out`, preserving their order, and
+/// returns the number of values written
+///
+/// Values in `out` after those may be overwritten.
+///
+/// ### Panics
+///   - If `out` is shorter than `lanes::<S>()`
+#[inline(always)]
+fn compress_into<S: Simd>(v: U16s<S>, mask: u64, out: &mut [u16]) -> usize {
+    let mut len = 0;
+    for_each_compressed_block::<S>(v, mask, |block, count| {
+        block.store_slice(&mut out[len..len + BLOCK_LANES]);
+        len += count;
+    });
+    len
 }
 
 /// Move the values in `val` with the corresponding index in `bitmask`
@@ -556,6 +737,10 @@ mod test {
     use crate::bitmap::store::array_store::visitor::VecWriter;
     use alloc::vec::Vec;
     use proptest::prelude::*;
+
+    fn lanes_of<S: Simd>(_: S) -> usize {
+        lanes::<S>()
+    }
 
     /// Checks the vectorized op produces the same result as the scalar op
     fn check_op(
@@ -613,12 +798,13 @@ mod test {
 
     #[test]
     fn vector_ops_match_scalar_at_lane_boundaries() {
-        // Lengths around multiples of `LANES` exercise the scalar fallback, the vector loops,
-        // and the partial vector tails; the offsets give disjoint, interleaved, and equal inputs.
-        let lens = [0, 1, 7, 8, 9, 15, 16, 17, 24, 25];
+        // Lengths around multiples of the vector widths (8, 16 and 32 lanes) exercise the scalar
+        // fallback, the vector loops, and the partial vector tails; the offsets give disjoint,
+        // interleaved, and equal inputs.
+        let lens = [0, 1, 7, 8, 9, 15, 16, 17, 24, 25, 31, 32, 33, 48, 63, 64, 65, 96, 97];
         for len_l in lens {
             for len_r in lens {
-                for offset in [0, 1, 4, 8, 64] {
+                for offset in [0, 1, 4, 8, 16, 32, 128] {
                     let lhs: Vec<u16> = (0..len_l).map(|x| 2 * x).collect();
                     let rhs: Vec<u16> = (0..len_r).map(|x| 2 * x + offset).collect();
                     check_all(&lhs, &rhs);
@@ -627,17 +813,30 @@ mod test {
         }
     }
 
+    fn check_matrix_cmp<S: Simd>(simd: S, a: &[u16], b: &[u16], may_contain_zero: bool) {
+        let expected = a
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| b.contains(x))
+            .fold(0u64, |mask, (i, _)| mask | (1 << i));
+        let (va, vb) = (load(simd, a), load(simd, b));
+        assert_eq!(matrix_cmp_u16::<S>(va, vb).to_bitmask(), expected);
+        assert_eq!(matrix_cmp_bitmask::<S>(va, vb, a, b, may_contain_zero), expected);
+    }
+
     #[test]
     fn matrix_cmp_finds_lanes_of_a_in_b() {
         dispatch!(level(), simd => {
-            let a = u16x8::from_slice(simd, &[1, 2, 3, 4, 32, 33, 34, 35]);
-            let b = u16x8::from_slice(simd, &[2, 4, 6, 8, 10, 12, 14, 35]);
-            assert_eq!(matrix_cmp_u16(a, b).to_bitmask(), 0b1000_1010);
-            assert_eq!(matrix_cmp_bitmask(a, b, false), 0b1000_1010);
-            assert_eq!(matrix_cmp_bitmask(a, b, true), 0b1000_1010);
-            let a = u16x8::from_slice(simd, &[0, 2, 3, 4, 32, 33, 34, 35]);
-            let b = u16x8::from_slice(simd, &[0, 4, 6, 8, 10, 12, 14, 35]);
-            assert_eq!(matrix_cmp_bitmask(a, b, true), 0b1000_1001);
+            let n = lanes_of(simd) as u16;
+            let odd: Vec<u16> = (1..=n).collect();
+            let even: Vec<u16> = (1..=n).map(|x| 2 * x).collect();
+            check_matrix_cmp(simd, &odd, &even, false);
+            check_matrix_cmp(simd, &odd, &even, true);
+            let from_zero: Vec<u16> = (0..n).collect();
+            let even_from_zero: Vec<u16> = (0..n).map(|x| 2 * x).collect();
+            check_matrix_cmp(simd, &from_zero, &even_from_zero, true);
+            let reversed: Vec<u16> = (0..n).rev().collect();
+            check_matrix_cmp(simd, &even_from_zero, &reversed, true);
         });
     }
 }
