@@ -76,21 +76,6 @@ pub fn or(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
 
 #[simd]
 fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
-    // De-duplicates `slice` in place
-    // Returns the end index of the deduplicated slice.
-    // elements after the return value are not guaranteed to be unique or in order
-    #[inline]
-    fn dedup(slice: &mut [u16]) -> usize {
-        let mut pos: usize = 1;
-        for i in 1..slice.len() {
-            if slice[i] != slice[i - 1] {
-                slice[pos] = slice[i];
-                pos += 1;
-            }
-        }
-        pos
-    }
-
     // returns `new`, with a mask of its values which were not already written,
     // assuming that the previously written vector was `old`
     #[inline(always)]
@@ -153,30 +138,22 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
 
     debug_assert!(i == len1 || j == len2);
 
-    // we finish the rest off using a scalar algorithm
-    // could be improved?
-    //
-    // copy the small end on a tmp buffer
-    let mut buffer: [u16; 2 * MAX_LANES] = [0; 2 * MAX_LANES];
+    // we finish the rest off using a scalar algorithm:
+    // the values of `v_max` which haven't been written, and the tail of the array which ran out
+    // of whole vectors, are both sorted and shorter than a vector. Merge them, and then merge the
+    // result with the rest of the other array
+    let mut rest_max = [0u16; MAX_LANES];
     let (v, m) = handle_vector::<S>(v_prev, v_max);
-    let mut rem = compress_into::<S>(v, m, &mut buffer);
+    let rest_max_len = compress_into::<S>(v, m, &mut rest_max);
 
-    let (tail_a, tail_b, tail_len) = if i == len1 {
-        (&lhs[n * i..], &rhs[n * j..], lhs.len() - n * len1)
-    } else {
-        (&rhs[n * j..], &lhs[n * i..], rhs.len() - n * len2)
-    };
+    let (tail_a, tail_b) =
+        if i == len1 { (&lhs[n * i..], &rhs[n * j..]) } else { (&rhs[n * j..], &lhs[n * i..]) };
 
-    buffer[rem..rem + tail_len].copy_from_slice(tail_a);
-    rem += tail_len;
-
-    if rem == 0 {
-        visitor.visit_slice(tail_b)
-    } else {
-        buffer[..rem].sort_unstable();
-        rem = dedup(&mut buffer[..rem]);
-        scalar::or(&buffer[..rem], tail_b, visitor);
-    }
+    let mut merged = [0u16; 2 * MAX_LANES];
+    let mut writer = SliceWriter::new(&mut merged);
+    scalar::or(&rest_max[..rest_max_len], tail_a, &mut writer);
+    let merged_len = writer.len();
+    scalar::or(&merged[..merged_len], tail_b, visitor);
 }
 
 pub fn and(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
@@ -229,23 +206,6 @@ pub fn xor(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) 
 
 #[simd]
 fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
-    /// De-duplicates `slice` in place, removing _both_ duplicates
-    /// Returns the end index of the xor-ed slice.
-    /// elements after the return value are not guaranteed to be unique or in order
-    #[inline]
-    fn xor_slice(slice: &mut [u16]) -> usize {
-        let mut pos: usize = 1;
-        for i in 1..slice.len() {
-            if slice[i] != slice[i - 1] {
-                slice[pos] = slice[i];
-                pos += 1;
-            } else {
-                pos -= 1; // it is identical to previous, delete it
-            }
-        }
-        pos
-    }
-
     // returns the vector to write, and a mask of the values to write from it,
     // omitting repeated values assuming that previously written vector was "old"
     #[inline(always)]
@@ -312,14 +272,14 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
 
     debug_assert!(i == len1 || j == len2);
 
-    // we finish the rest off using a scalar algorithm
-    // could be improved?
-    // conditionally stores the last value of laststore as well as all but the
-    // last value of vecMax,
-    let mut buffer: [u16; 2 * MAX_LANES + 1] = [0; 2 * MAX_LANES + 1];
-    // remaining size
+    // we finish the rest off using a scalar algorithm:
+    // the values of `v_max` which haven't been written (all but the last value, which is written
+    // unless it equals the one before it), and the tail of the array which ran out of whole
+    // vectors, are both sorted and shorter than a vector. Merge them, and then merge the result
+    // with the rest of the other array
+    let mut rest_max = [0u16; MAX_LANES + 1];
     let (v, m) = handle_vector::<S>(v_prev, v_max);
-    let mut rem = compress_into::<S>(v, m, &mut buffer);
+    let mut rest_max_len = compress_into::<S>(v, m, &mut rest_max);
 
     // Store `v_max` rather than reading its lanes with `as_array()`, which makes LLVM split
     // `v_max` into pieces in the merge loop above
@@ -328,25 +288,50 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     let vec_last = arr_max[n - 1];
     let vec_second_last = arr_max[n - 2];
     if vec_second_last != vec_last {
-        buffer[rem] = vec_last;
-        rem += 1;
+        rest_max[rest_max_len] = vec_last;
+        rest_max_len += 1;
     }
 
-    let (tail_a, tail_b, tail_len) = if i == len1 {
-        (&lhs[n * i..], &rhs[n * j..], lhs.len() - n * len1)
-    } else {
-        (&rhs[n * j..], &lhs[n * i..], rhs.len() - n * len2)
-    };
+    let (tail_a, tail_b) =
+        if i == len1 { (&lhs[n * i..], &rhs[n * j..]) } else { (&rhs[n * j..], &lhs[n * i..]) };
 
-    buffer[rem..rem + tail_len].copy_from_slice(tail_a);
-    rem += tail_len;
+    let mut merged = [0u16; 2 * MAX_LANES + 1];
+    let mut writer = SliceWriter::new(&mut merged);
+    scalar::xor(&rest_max[..rest_max_len], tail_a, &mut writer);
+    let merged_len = writer.len();
+    scalar::xor(&merged[..merged_len], tail_b, visitor);
+}
 
-    if rem == 0 {
-        visitor.visit_slice(tail_b)
-    } else {
-        buffer[..rem].sort_unstable();
-        rem = xor_slice(&mut buffer[..rem]);
-        scalar::xor(&buffer[..rem], tail_b, visitor);
+/// A visitor that writes the values it visits to the front of a slice
+struct SliceWriter<'a> {
+    out: &'a mut [u16],
+    len: usize,
+}
+
+impl<'a> SliceWriter<'a> {
+    fn new(out: &'a mut [u16]) -> Self {
+        SliceWriter { out, len: 0 }
+    }
+
+    /// The number of values written
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl BinaryOperationVisitor for SliceWriter<'_> {
+    fn visit_vector<S: Simd>(&mut self, value: U16s<S>, mask: u64) {
+        self.len += compress_into::<S>(value, mask, &mut self.out[self.len..]);
+    }
+
+    fn visit_scalar(&mut self, value: u16) {
+        self.out[self.len] = value;
+        self.len += 1;
+    }
+
+    fn visit_slice(&mut self, values: &[u16]) {
+        self.out[self.len..self.len + values.len()].copy_from_slice(values);
+        self.len += values.len();
     }
 }
 
