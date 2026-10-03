@@ -85,8 +85,9 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
         (new, mask)
     }
 
-    let n = lanes::<S>();
-    if (lhs.len() < n) || (rhs.len() < n) {
+    // The last vector of each array is padded, so arrays shorter than a vector can be vectorized,
+    // but with fewer values than a 128-bit block, the scalar algorithm is faster
+    if (lhs.len() < BLOCK_LANES) || (rhs.len() < BLOCK_LANES) {
         scalar::or(lhs, rhs, visitor);
         return;
     }
@@ -162,8 +163,9 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
         (tmp2, !mask & lanes_bitmask::<S>())
     }
 
-    let n = lanes::<S>();
-    if (lhs.len() < n) || (rhs.len() < n) {
+    // The last vector of each array is padded, so arrays shorter than a vector can be vectorized,
+    // but with fewer values than a 128-bit block, the scalar algorithm is faster
+    if (lhs.len() < BLOCK_LANES) || (rhs.len() < BLOCK_LANES) {
         scalar::xor(lhs, rhs, visitor);
         return;
     }
