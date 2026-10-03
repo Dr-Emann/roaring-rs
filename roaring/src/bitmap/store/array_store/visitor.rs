@@ -1,5 +1,5 @@
 #[cfg(feature = "simd")]
-use crate::bitmap::store::array_store::vector::{for_each_compressed_block, U16s};
+use crate::bitmap::store::array_store::vector::{for_each_compressed_block, U16Vector};
 #[cfg(feature = "simd")]
 use fearless_simd::prelude::*;
 #[cfg(feature = "simd")]
@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 pub trait BinaryOperationVisitor {
     /// Visits the lanes of `value` with the corresponding bit of `mask` set
     #[cfg(feature = "simd")]
-    fn visit_vector<S: Simd>(&mut self, value: U16s<S>, mask: u64);
+    fn visit_vector<S: Simd, V: U16Vector<S>>(&mut self, value: V, mask: u64);
     fn visit_scalar(&mut self, value: u16);
     fn visit_slice(&mut self, values: &[u16]);
 }
@@ -46,8 +46,8 @@ impl VecWriter {
 impl BinaryOperationVisitor for VecWriter {
     #[cfg(feature = "simd")]
     #[simd]
-    fn visit_vector<S: Simd>(&mut self, value: U16s<S>, mask: u64) {
-        for_each_compressed_block::<S>(value, mask, |block, count| {
+    fn visit_vector<S: Simd, V: U16Vector<S>>(&mut self, value: V, mask: u64) {
+        for_each_compressed_block(value, mask, |block, count| {
             // This idiom is better than subslicing block, as it compiles down to an unaligned
             // vector store instr.
             // A more straightforward, but unsafe way would be ptr::write_unaligned and Vec::set_len
@@ -84,7 +84,7 @@ impl CardinalityCounter {
 
 impl BinaryOperationVisitor for CardinalityCounter {
     #[cfg(feature = "simd")]
-    fn visit_vector<S: Simd>(&mut self, _value: U16s<S>, mask: u64) {
+    fn visit_vector<S: Simd, V: U16Vector<S>>(&mut self, _value: V, mask: u64) {
         self.count += mask.count_ones() as usize;
     }
 
