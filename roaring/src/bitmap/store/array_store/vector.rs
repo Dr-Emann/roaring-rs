@@ -91,69 +91,12 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
         return;
     }
 
-    let len1: usize = lhs.len() / n;
-    let len2: usize = rhs.len() / n;
+    merge_vectors::<S>(simd, lhs, rhs, visitor, handle_vector::<S>);
 
-    let v_a: U16s<S> = load(simd, lhs);
-    let v_b: U16s<S> = load(simd, rhs);
-    let [mut v_min, mut v_max] = simd_merge_u16::<S>(v_a, v_b);
-
-    let mut i = 1;
-    let mut j = 1;
-    let (v, m) = handle_vector::<S>(U16s::<S>::splat(simd, u16::MAX), v_min);
-    visitor.visit_vector::<S>(v, m);
-    let mut v_prev: U16s<S> = v_min;
-    if (i < len1) && (j < len2) {
-        let mut v: U16s<S>;
-        let mut cur_a: u16 = lhs[n * i];
-        let mut cur_b: u16 = rhs[n * j];
-        loop {
-            if cur_a <= cur_b {
-                v = load(simd, &lhs[n * i..]);
-                i += 1;
-                if i < len1 {
-                    cur_a = lhs[n * i];
-                } else {
-                    break;
-                }
-            } else {
-                v = load(simd, &rhs[n * j..]);
-                j += 1;
-                if j < len2 {
-                    cur_b = rhs[n * j];
-                } else {
-                    break;
-                }
-            }
-            [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
-            let (v, m) = handle_vector::<S>(v_prev, v_min);
-            visitor.visit_vector::<S>(v, m);
-            v_prev = v_min;
-        }
-        [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
-        let (v, m) = handle_vector::<S>(v_prev, v_min);
-        visitor.visit_vector::<S>(v, m);
-        v_prev = v_min;
+    // `u16::MAX` is skipped, as it is used as padding
+    if lhs.last() == Some(&u16::MAX) || rhs.last() == Some(&u16::MAX) {
+        visitor.visit_scalar(u16::MAX);
     }
-
-    debug_assert!(i == len1 || j == len2);
-
-    // we finish the rest off using a scalar algorithm:
-    // the values of `v_max` which haven't been written, and the tail of the array which ran out
-    // of whole vectors, are both sorted and shorter than a vector. Merge them, and then merge the
-    // result with the rest of the other array
-    let mut rest_max = [0u16; MAX_LANES];
-    let (v, m) = handle_vector::<S>(v_prev, v_max);
-    let rest_max_len = compress_into::<S>(v, m, &mut rest_max);
-
-    let (tail_a, tail_b) =
-        if i == len1 { (&lhs[n * i..], &rhs[n * j..]) } else { (&rhs[n * j..], &lhs[n * i..]) };
-
-    let mut merged = [0u16; 2 * MAX_LANES];
-    let mut writer = SliceWriter::new(&mut merged);
-    scalar::or(&rest_max[..rest_max_len], tail_a, &mut writer);
-    let merged_len = writer.len();
-    scalar::or(&merged[..merged_len], tail_b, visitor);
 }
 
 pub fn and(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
@@ -225,114 +168,112 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
         return;
     }
 
-    let len1: usize = lhs.len() / n;
-    let len2: usize = rhs.len() / n;
+    let v_max = merge_vectors::<S>(simd, lhs, rhs, visitor, handle_vector::<S>);
+    // Each value is written once the value after it is known, so write the last value of the
+    // last vector, which is followed by padding
+    let (v, m) = handle_vector::<S>(v_max, U16s::<S>::splat(simd, u16::MAX));
+    visit_without_max::<S>(visitor, v, m);
 
-    let v_a: U16s<S> = load(simd, lhs);
-    let v_b: U16s<S> = load(simd, rhs);
-    let [mut v_min, mut v_max] = simd_merge_u16::<S>(v_a, v_b);
+    // `u16::MAX` is skipped, as it is used as padding
+    if (lhs.last() == Some(&u16::MAX)) != (rhs.last() == Some(&u16::MAX)) {
+        visitor.visit_scalar(u16::MAX);
+    }
+}
+
+/// The vectors of a sorted array, where the last vector is padded with `u16::MAX` if the length
+/// of the array isn't a multiple of the number of lanes
+struct PaddedVectors<'a> {
+    values: &'a [u16],
+    /// The number of lanes in a vector
+    lanes: usize,
+    /// The number of vectors which aren't padded
+    full: usize,
+    /// The number of vectors, including the padded one
+    len: usize,
+    padded: [u16; MAX_LANES],
+}
+
+impl<'a> PaddedVectors<'a> {
+    #[inline(always)]
+    fn new<S: Simd>(values: &'a [u16]) -> Self {
+        let lanes = lanes::<S>();
+        let full = values.len() / lanes;
+        let rest = &values[full * lanes..];
+        let mut padded = [u16::MAX; MAX_LANES];
+        padded[..rest.len()].copy_from_slice(rest);
+        let len = full + usize::from(!rest.is_empty());
+        PaddedVectors { values, lanes, full, len, padded }
+    }
+
+    /// The first value of vector `i`
+    #[inline(always)]
+    fn first(&self, i: usize) -> u16 {
+        self.values[i * self.lanes]
+    }
+
+    /// Loads vector `i`
+    #[inline(always)]
+    fn load<S: Simd>(&self, simd: S, i: usize) -> U16s<S> {
+        if i < self.full {
+            load(simd, &self.values[i * self.lanes..])
+        } else {
+            load(simd, &self.padded)
+        }
+    }
+}
+
+/// Merges the vectors of the sorted arrays `lhs` and `rhs`, visiting each merged vector with the
+/// mask from `handle_vector(previous vector, vector)`, except for lanes which are `u16::MAX`
+///
+/// Returns the last vector, which is the larger half of the last merge, and has been visited
+/// with the vector before it.
+#[inline(always)]
+fn merge_vectors<S: Simd>(
+    simd: S,
+    lhs: &[u16],
+    rhs: &[u16],
+    visitor: &mut impl BinaryOperationVisitor,
+    handle_vector: impl Fn(U16s<S>, U16s<S>) -> (U16s<S>, u64),
+) -> U16s<S> {
+    // The last vector of each array is padded with `u16::MAX`, so that the vectorized merge
+    // handles every value: `u16::MAX` is skipped when visiting merged vectors
+    let a = PaddedVectors::new::<S>(lhs);
+    let b = PaddedVectors::new::<S>(rhs);
+
+    let [mut v_min, mut v_max] = simd_merge_u16::<S>(a.load(simd, 0), b.load(simd, 0));
+    let (v, m) = handle_vector(U16s::<S>::splat(simd, u16::MAX), v_min);
+    visit_without_max::<S>(visitor, v, m);
+    let mut v_prev = v_min;
 
     let mut i = 1;
     let mut j = 1;
-    let (v, m) = handle_vector::<S>(U16s::<S>::splat(simd, u16::MAX), v_min);
-    visitor.visit_vector::<S>(v, m);
-    let mut v_prev: U16s<S> = v_min;
-    if (i < len1) && (j < len2) {
-        let mut v: U16s<S>;
-        let mut cur_a: u16 = lhs[n * i];
-        let mut cur_b: u16 = rhs[n * j];
-        loop {
-            if cur_a <= cur_b {
-                v = load(simd, &lhs[n * i..]);
-                i += 1;
-                if i < len1 {
-                    cur_a = lhs[n * i];
-                } else {
-                    break;
-                }
-            } else {
-                v = load(simd, &rhs[n * j..]);
-                j += 1;
-                if j < len2 {
-                    cur_b = rhs[n * j];
-                } else {
-                    break;
-                }
-            }
-            [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
-            let (v, m) = handle_vector::<S>(v_prev, v_min);
-            visitor.visit_vector::<S>(v, m);
-            v_prev = v_min;
-        }
+    loop {
+        // Merge the vector which starts with the smaller value next
+        let v = if i < a.len && (j == b.len || a.first(i) <= b.first(j)) {
+            i += 1;
+            a.load(simd, i - 1)
+        } else if j < b.len {
+            j += 1;
+            b.load(simd, j - 1)
+        } else {
+            break;
+        };
         [v_min, v_max] = simd_merge_u16::<S>(v, v_max);
-        let (v, m) = handle_vector::<S>(v_prev, v_min);
-        visitor.visit_vector::<S>(v, m);
+        let (v, m) = handle_vector(v_prev, v_min);
+        visit_without_max::<S>(visitor, v, m);
         v_prev = v_min;
     }
 
-    debug_assert!(i == len1 || j == len2);
-
-    // we finish the rest off using a scalar algorithm:
-    // the values of `v_max` which haven't been written (all but the last value, which is written
-    // unless it equals the one before it), and the tail of the array which ran out of whole
-    // vectors, are both sorted and shorter than a vector. Merge them, and then merge the result
-    // with the rest of the other array
-    let mut rest_max = [0u16; MAX_LANES + 1];
-    let (v, m) = handle_vector::<S>(v_prev, v_max);
-    let mut rest_max_len = compress_into::<S>(v, m, &mut rest_max);
-
-    // Store `v_max` rather than reading its lanes with `as_array()`, which makes LLVM split
-    // `v_max` into pieces in the merge loop above
-    let mut arr_max = [0u16; MAX_LANES];
-    store::<S>(v_max, &mut arr_max);
-    let vec_last = arr_max[n - 1];
-    let vec_second_last = arr_max[n - 2];
-    if vec_second_last != vec_last {
-        rest_max[rest_max_len] = vec_last;
-        rest_max_len += 1;
-    }
-
-    let (tail_a, tail_b) =
-        if i == len1 { (&lhs[n * i..], &rhs[n * j..]) } else { (&rhs[n * j..], &lhs[n * i..]) };
-
-    let mut merged = [0u16; 2 * MAX_LANES + 1];
-    let mut writer = SliceWriter::new(&mut merged);
-    scalar::xor(&rest_max[..rest_max_len], tail_a, &mut writer);
-    let merged_len = writer.len();
-    scalar::xor(&merged[..merged_len], tail_b, visitor);
+    let (v, m) = handle_vector(v_prev, v_max);
+    visit_without_max::<S>(visitor, v, m);
+    v_max
 }
 
-/// A visitor that writes the values it visits to the front of a slice
-struct SliceWriter<'a> {
-    out: &'a mut [u16],
-    len: usize,
-}
-
-impl<'a> SliceWriter<'a> {
-    fn new(out: &'a mut [u16]) -> Self {
-        SliceWriter { out, len: 0 }
-    }
-
-    /// The number of values written
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl BinaryOperationVisitor for SliceWriter<'_> {
-    fn visit_vector<S: Simd>(&mut self, value: U16s<S>, mask: u64) {
-        self.len += compress_into::<S>(value, mask, &mut self.out[self.len..]);
-    }
-
-    fn visit_scalar(&mut self, value: u16) {
-        self.out[self.len] = value;
-        self.len += 1;
-    }
-
-    fn visit_slice(&mut self, values: &[u16]) {
-        self.out[self.len..self.len + values.len()].copy_from_slice(values);
-        self.len += values.len();
-    }
+/// Visits the lanes of `v` selected by `mask`, except for lanes which are `u16::MAX`
+#[inline(always)]
+fn visit_without_max<S: Simd>(visitor: &mut impl BinaryOperationVisitor, v: U16s<S>, mask: u64) {
+    let mask = mask & !v.simd_eq(u16::MAX).to_bitmask();
+    visitor.visit_vector::<S>(v, mask);
 }
 
 pub fn sub(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
@@ -440,15 +381,6 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
 #[inline(always)]
 fn load<S: Simd>(simd: S, src: &[u16]) -> U16s<S> {
     U16s::<S>::from_slice(simd, &src[..lanes::<S>()])
-}
-
-/// write `v` to the first `lanes::<S>()` values of `out`
-///
-/// ### Panics
-///   - If `out` is shorter than `lanes::<S>()`
-#[inline(always)]
-fn store<S: Simd>(v: U16s<S>, out: &mut [u16]) {
-    v.store_slice(&mut out[..lanes::<S>()])
 }
 
 /// `[old[N - 1], new[0], ..., new[N - 2]]`, where `N` is the number of lanes
@@ -666,23 +598,6 @@ pub fn for_each_compressed_block<S: Simd>(
     }
 }
 
-/// Writes the values of `v` selected by `mask` to the front of `out`, preserving their order, and
-/// returns the number of values written
-///
-/// Values in `out` after those may be overwritten.
-///
-/// ### Panics
-///   - If `out` is shorter than `lanes::<S>()`
-#[inline(always)]
-fn compress_into<S: Simd>(v: U16s<S>, mask: u64, out: &mut [u16]) -> usize {
-    let mut len = 0;
-    for_each_compressed_block::<S>(v, mask, |block, count| {
-        block.store_slice(&mut out[len..len + BLOCK_LANES]);
-        len += count;
-    });
-    len
-}
-
 /// Move the values in `val` with the corresponding index in `bitmask`
 /// set to the front of the return vector, preserving their order.
 ///
@@ -792,6 +707,24 @@ mod test {
                 for offset in [0, 1, 4, 8, 16, 32, 128] {
                     let lhs: Vec<u16> = (0..len_l).map(|x| 2 * x).collect();
                     let rhs: Vec<u16> = (0..len_r).map(|x| 2 * x + offset).collect();
+                    check_all(&lhs, &rhs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_ops_match_scalar_with_max_value() {
+        // `u16::MAX` is used as padding, so check inputs where neither, either or both arrays
+        // contain it, with lengths around multiples of the vector widths
+        let lens = [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65];
+        for len_l in lens {
+            for len_r in lens {
+                for (gap_l, gap_r) in [(0, 0), (0, 1), (1, 0), (1, 1), (0, 3)] {
+                    let lhs: Vec<u16> =
+                        (0..len_l).rev().map(|x| u16::MAX - gap_l - 2 * x).collect();
+                    let rhs: Vec<u16> =
+                        (0..len_r).rev().map(|x| u16::MAX - gap_r - 2 * x).collect();
                     check_all(&lhs, &rhs);
                 }
             }
