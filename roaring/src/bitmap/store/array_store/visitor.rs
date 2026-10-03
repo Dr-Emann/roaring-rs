@@ -2,6 +2,8 @@
 use crate::bitmap::store::array_store::vector::swizzle_to_front;
 #[cfg(feature = "simd")]
 use fearless_simd::{prelude::*, u16x8};
+#[cfg(feature = "simd")]
+use fearless_simd_macros::simd;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -41,9 +43,8 @@ impl VecWriter {
 }
 
 impl BinaryOperationVisitor for VecWriter {
-    // Inlined so it is compiled with the target features of the calling vectorized algorithm
     #[cfg(feature = "simd")]
-    #[inline(always)]
+    #[simd]
     fn visit_vector<S: Simd>(&mut self, value: u16x8<S>, mask: u8) {
         let result = swizzle_to_front(value, mask);
 
@@ -82,7 +83,6 @@ impl CardinalityCounter {
 
 impl BinaryOperationVisitor for CardinalityCounter {
     #[cfg(feature = "simd")]
-    #[inline(always)]
     fn visit_vector<S: Simd>(&mut self, _value: u16x8<S>, mask: u8) {
         self.count += mask.count_ones() as usize;
     }

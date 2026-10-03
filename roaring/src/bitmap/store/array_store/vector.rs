@@ -9,8 +9,8 @@
 //! and is portable.
 //!
 //! The public functions select a SIMD level at runtime with `fearless_simd::dispatch!`, and call
-//! `#[inline(always)]` implementations generic over the SIMD level, so that they are compiled
-//! with the matching target features enabled.
+//! implementations generic over the SIMD level. Those are annotated with `#[simd]`, so that they
+//! are compiled with the matching target features enabled.
 
 #![cfg(feature = "simd")]
 
@@ -18,6 +18,7 @@ use super::scalar;
 use crate::bitmap::store::array_store::visitor::BinaryOperationVisitor;
 use fearless_simd::prelude::*;
 use fearless_simd::{dispatch, mask16x8, u16x8, u8x16, Level};
+use fearless_simd_macros::simd;
 
 /// The number of lanes in a `u16x8`
 const LANES: usize = 8;
@@ -36,7 +37,7 @@ pub fn or(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     dispatch!(level(), simd => or_impl(simd, lhs, rhs, visitor))
 }
 
-#[inline(always)]
+#[simd]
 fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     // De-duplicates `slice` in place
     // Returns the end index of the deduplicated slice.
@@ -55,7 +56,7 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
 
     // returns `new`, with a mask of its values which were not already written,
     // assuming that the previously written vector was `old`
-    #[inline(always)]
+    #[simd]
     fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
         let tmp: u16x8<S> = shr1(new, old);
         let mask = 255 - tmp.simd_eq(new).to_bitmask() as u8;
@@ -145,7 +146,7 @@ pub fn and(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) 
     dispatch!(level(), simd => and_impl(simd, lhs, rhs, visitor))
 }
 
-#[inline(always)]
+#[simd]
 fn and_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     let st_a = (lhs.len() / LANES) * LANES;
     let st_b = (rhs.len() / LANES) * LANES;
@@ -187,7 +188,7 @@ pub fn xor(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) 
     dispatch!(level(), simd => xor_impl(simd, lhs, rhs, visitor))
 }
 
-#[inline(always)]
+#[simd]
 fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     /// De-duplicates `slice` in place, removing _both_ duplicates
     /// Returns the end index of the xor-ed slice.
@@ -208,7 +209,7 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
 
     // returns the vector to write, and a mask of the values to write from it,
     // omitting repeated values assuming that previously written vector was "old"
-    #[inline(always)]
+    #[simd]
     fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
         let tmp1: u16x8<S> = shr2(new, old);
         let tmp2: u16x8<S> = shr1(new, old);
@@ -311,7 +312,7 @@ pub fn sub(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) 
     dispatch!(level(), simd => sub_impl(simd, lhs, rhs, visitor))
 }
 
-#[inline(always)]
+#[simd]
 fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     // we handle the degenerate cases
     if lhs.is_empty() {
@@ -398,7 +399,7 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
 ///
 /// ### Panics
 ///   - If `src` is shorter than `LANES`
-#[inline(always)]
+#[simd]
 fn load<S: Simd>(simd: S, src: &[u16]) -> u16x8<S> {
     u16x8::from_slice(simd, &src[..LANES])
 }
@@ -407,7 +408,7 @@ fn load<S: Simd>(simd: S, src: &[u16]) -> u16x8<S> {
 ///
 /// ### Panics
 ///   - If `out` is shorter than `LANES`
-#[inline(always)]
+#[simd]
 fn store<S: Simd>(v: u16x8<S>, out: &mut [u16]) {
     v.store_slice(&mut out[..LANES])
 }
@@ -423,7 +424,7 @@ fn store<S: Simd>(v: u16x8<S>, out: &mut [u16]) {
 /// let result = matrix_cmp_u16(a, b);
 /// assert_eq!(result.to_bitmask(), 0b0000_1010);
 /// ```
-#[inline(always)]
+#[simd]
 fn matrix_cmp_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> mask16x8<S> {
     a.simd_eq(b)
         | a.simd_eq(b.rotate_elements_left::<1>())
@@ -437,7 +438,7 @@ fn matrix_cmp_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> mask16x8<S> {
 
 /// Append to vectors to an imaginary 16 lane vector,  shift the lanes right by 1, then
 /// truncate to the low order 8 lanes
-#[inline(always)]
+#[simd]
 fn shr1<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> u16x8<S> {
     // `[b[7], a[0], a[1], ..., a[6]]`
     b.slide::<7>(a)
@@ -445,7 +446,7 @@ fn shr1<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> u16x8<S> {
 
 /// Append to vectors to an imaginary 16 lane vector,  shift the lanes right by 2, then
 /// truncate to the low order 8 lanes
-#[inline(always)]
+#[simd]
 fn shr2<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> u16x8<S> {
     // `[b[6], b[7], a[0], a[1], ..., a[5]]`
     b.slide::<6>(a)
@@ -455,7 +456,7 @@ fn shr2<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> u16x8<S> {
 /// Developed originally for merge sort using SIMD instructions.
 /// Standard merge. See, e.g., Inoue and Taura, SIMD- and Cache-Friendly
 /// Algorithm for Sorting an Array of Structures
-#[inline(always)]
+#[simd]
 fn simd_merge_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> [u16x8<S>; 2] {
     let mut tmp: u16x8<S> = a.min(b);
     let mut max: u16x8<S> = a.max(b);
@@ -479,7 +480,7 @@ fn simd_merge_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> [u16x8<S>; 2] {
 //
 // e.g. if `bitmask` is `0b0101`, then swizzle the first two bytes (the first u16 lane) to the
 // first two positions, and the 5th and 6th bytes (the third u16 lane) to the next two positions.
-#[inline(always)]
+#[simd]
 pub fn swizzle_to_front<S: Simd>(val: u16x8<S>, bitmask: u8) -> u16x8<S> {
     static SWIZZLE_TABLE: [[u8; 16]; 256] = {
         let mut table = [[0; 16]; 256];
@@ -514,7 +515,7 @@ mod test {
     use proptest::prelude::*;
 
     /// Checks the vectorized op produces the same result as the scalar op
-    #[inline(always)]
+    #[simd]
     fn check_op<S: Simd>(
         simd: S,
         vector: impl Fn(&[u16], &[u16], &mut VecWriter),
@@ -525,10 +526,7 @@ mod test {
         let mut expected = VecWriter::new(lhs.len() + rhs.len());
         scalar(lhs, rhs, &mut expected);
         let mut actual = VecWriter::new(lhs.len() + rhs.len());
-        simd.vectorize(
-            #[inline(always)]
-            || vector(lhs, rhs, &mut actual),
-        );
+        vector(lhs, rhs, &mut actual);
         assert_eq!(actual.into_inner(), expected.into_inner());
     }
 
