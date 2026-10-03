@@ -53,7 +53,7 @@ impl BinaryOperationVisitor for VecWriter {
         // A more straightforward, but unsafe way would be ptr::write_unaligned and Vec::set_len
         // Writing a vector at once is why the vectorized algorithms do not operate in place
         // first write the entire vector
-        self.vec.extend_from_slice(&result.as_array()[..]);
+        self.vec.extend_from_slice(result.as_slice());
         // next truncate the masked out values
         self.vec.truncate(self.vec.len() - (result.len() - mask.count_ones() as usize));
     }

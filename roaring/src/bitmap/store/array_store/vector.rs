@@ -4,9 +4,8 @@
 //! Prior work: Schlegel et al., Fast Sorted-Set Intersection using SIMD Instructions
 //!
 //! Rust port notes:
-//! The x86 PCMPESTRM instruction has been replaced with a simple vector or-shift
-//! While several more instructions, this is what is available through LLVM intrinsics
-//! and is portable.
+//! The x86 PCMPESTRM instruction has been replaced with a portable all-pairs comparison
+//! (see `matrix_cmp_u16`), which takes more instructions but is available on every SIMD level.
 //!
 //! The public functions select a SIMD level at runtime with `fearless_simd::dispatch!`, and call
 //! implementations generic over the SIMD level. Those are annotated with `#[simd]`, so that they
@@ -17,7 +16,7 @@
 use super::scalar;
 use crate::bitmap::store::array_store::visitor::BinaryOperationVisitor;
 use fearless_simd::prelude::*;
-use fearless_simd::{dispatch, mask16x8, u16x8, u8x16, Level};
+use fearless_simd::{dispatch, mask16x8, u16x8, Level};
 use fearless_simd_macros::simd;
 
 /// The number of lanes in a `u16x8`
@@ -25,14 +24,18 @@ const LANES: usize = 8;
 
 /// The SIMD level to use.
 ///
-/// With `std`, this is detected at runtime (and cached by `fearless_simd`).
+/// With `std`, this is detected at runtime on x86/x86-64 (and cached by `fearless_simd`).
 /// Otherwise, it is determined by the target features enabled at compile time.
 #[inline]
 fn level() -> Level {
-    Level::try_detect().unwrap_or(Level::baseline())
+    // `Level::new()` is inlined, unlike `Level::try_detect()`
+    #[cfg(feature = "std")]
+    return Level::new();
+    #[cfg(not(feature = "std"))]
+    return Level::baseline();
 }
 
-// a one-pass SSE union algorithm
+// a one-pass union algorithm
 pub fn or(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     dispatch!(level(), simd => or_impl(simd, lhs, rhs, visitor))
 }
@@ -58,7 +61,8 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
     // assuming that the previously written vector was `old`
     #[simd]
     fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
-        let tmp: u16x8<S> = shr1(new, old);
+        // `[old[7], new[0], ..., new[6]]`
+        let tmp: u16x8<S> = old.slide::<7>(new);
         let mask = 255 - tmp.simd_eq(new).to_bitmask() as u8;
         (new, mask)
     }
@@ -183,7 +187,7 @@ fn and_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     scalar::and(&lhs[i..], &rhs[j..], visitor);
 }
 
-// a one-pass SSE xor algorithm
+// a one-pass xor algorithm
 pub fn xor(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
     dispatch!(level(), simd => xor_impl(simd, lhs, rhs, visitor))
 }
@@ -211,8 +215,10 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     // omitting repeated values assuming that previously written vector was "old"
     #[simd]
     fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
-        let tmp1: u16x8<S> = shr2(new, old);
-        let tmp2: u16x8<S> = shr1(new, old);
+        // `[old[6], old[7], new[0], ..., new[5]]`
+        let tmp1: u16x8<S> = old.slide::<6>(new);
+        // `[old[7], new[0], ..., new[6]]`
+        let tmp2: u16x8<S> = old.slide::<7>(new);
         let eq_l: mask16x8<S> = tmp2.simd_eq(tmp1);
         let eq_r: mask16x8<S> = tmp2.simd_eq(new);
         let eq_l_or_r: mask16x8<S> = eq_l | eq_r;
@@ -282,7 +288,10 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
     store(swizzle_to_front(v, m), buffer.as_mut_slice());
     let mut rem = m.count_ones() as usize;
 
-    let arr_max = v_max.as_array();
+    // Store `v_max` rather than reading its lanes with `as_array()`, which makes LLVM split
+    // `v_max` into pieces in the merge loop above
+    let mut arr_max = [0u16; LANES];
+    store(v_max, &mut arr_max);
     let vec7 = arr_max[7];
     let vec6 = arr_max[6];
     if vec6 != vec7 {
@@ -381,7 +390,9 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
                 v_b = load(simd, &buffer);
                 let a_found_in_b: u8 = matrix_cmp_u16(v_a, v_b).to_bitmask() as u8;
                 runningmask_a_found_in_b |= a_found_in_b;
-                let [.., max_va] = *v_a.as_array();
+                // Read from `lhs` (which `v_a` was loaded from): reading a lane of `v_a` makes LLVM
+                // split `v_a` into pieces in the loop above
+                let max_va = lhs[i + LANES - 1];
                 let used_rhs = remaining_rhs.partition_point(|&b| b <= max_va);
                 j += used_rhs;
             }
@@ -436,22 +447,6 @@ fn matrix_cmp_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> mask16x8<S> {
         | a.simd_eq(b.rotate_elements_left::<7>())
 }
 
-/// Append to vectors to an imaginary 16 lane vector,  shift the lanes right by 1, then
-/// truncate to the low order 8 lanes
-#[simd]
-fn shr1<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> u16x8<S> {
-    // `[b[7], a[0], a[1], ..., a[6]]`
-    b.slide::<7>(a)
-}
-
-/// Append to vectors to an imaginary 16 lane vector,  shift the lanes right by 2, then
-/// truncate to the low order 8 lanes
-#[simd]
-fn shr2<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> u16x8<S> {
-    // `[b[6], b[7], a[0], a[1], ..., a[5]]`
-    b.slide::<6>(a)
-}
-
 /// Assuming that a and b are sorted, returns an array of the sorted output.
 /// Developed originally for merge sort using SIMD instructions.
 /// Standard merge. See, e.g., Inoue and Taura, SIMD- and Cache-Friendly
@@ -502,22 +497,18 @@ pub fn swizzle_to_front<S: Simd>(val: u16x8<S>, bitmask: u8) -> u16x8<S> {
 
     // Our swizzle table retains the order of the bytes in the 16 bit lanes,
     // so it works with either native byte order.
-    let swizzle_idxs = u8x16::from_slice(val.token(), &SWIZZLE_TABLE[bitmask as usize]);
-    val.swizzle_dyn(swizzle_idxs)
+    val.swizzle_dyn(SWIZZLE_TABLE[bitmask as usize])
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::bitmap::store::array_store::visitor::VecWriter;
-    use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
     use proptest::prelude::*;
 
     /// Checks the vectorized op produces the same result as the scalar op
-    #[simd]
-    fn check_op<S: Simd>(
-        simd: S,
+    fn check_op(
         vector: impl Fn(&[u16], &[u16], &mut VecWriter),
         scalar: impl Fn(&[u16], &[u16], &mut VecWriter),
         lhs: &[u16],
@@ -530,18 +521,12 @@ mod test {
         assert_eq!(actual.into_inner(), expected.into_inner());
     }
 
-    /// Checks all vectorized ops at both the baseline and the detected SIMD levels
-    fn check_all(lhs: &BTreeSet<u16>, rhs: &BTreeSet<u16>) {
-        let lhs: Vec<u16> = lhs.iter().copied().collect();
-        let rhs: Vec<u16> = rhs.iter().copied().collect();
-        for level in [Level::baseline(), level()] {
-            dispatch!(level, simd => {
-                check_op(simd, |l, r, v| or_impl(simd, l, r, v), scalar::or, &lhs, &rhs);
-                check_op(simd, |l, r, v| and_impl(simd, l, r, v), scalar::and, &lhs, &rhs);
-                check_op(simd, |l, r, v| xor_impl(simd, l, r, v), scalar::xor, &lhs, &rhs);
-                check_op(simd, |l, r, v| sub_impl(simd, l, r, v), scalar::sub, &lhs, &rhs);
-            });
-        }
+    /// Checks all vectorized ops produce the same results as the scalar ops
+    fn check_all(lhs: &[u16], rhs: &[u16]) {
+        check_op(or, scalar::or, lhs, rhs);
+        check_op(and, scalar::and, lhs, rhs);
+        check_op(xor, scalar::xor, lhs, rhs);
+        check_op(sub, scalar::sub, lhs, rhs);
     }
 
     proptest! {
@@ -550,7 +535,7 @@ mod test {
             lhs in prop::collection::btree_set(0u16..256, 0..200),
             rhs in prop::collection::btree_set(0u16..256, 0..200),
         ) {
-            check_all(&lhs, &rhs);
+            check_all(&Vec::from_iter(lhs), &Vec::from_iter(rhs));
         }
 
         #[test]
@@ -558,7 +543,7 @@ mod test {
             lhs in prop::collection::btree_set(any::<u16>(), 0..200),
             rhs in prop::collection::btree_set(any::<u16>(), 0..200),
         ) {
-            check_all(&lhs, &rhs);
+            check_all(&Vec::from_iter(lhs), &Vec::from_iter(rhs));
         }
     }
 
@@ -577,13 +562,19 @@ mod test {
     }
 
     #[test]
-    fn shr_matches_concat_shift() {
-        dispatch!(level(), simd => {
-            let a = u16x8::from_slice(simd, &[0, 1, 2, 3, 4, 5, 6, 7]);
-            let b = u16x8::from_slice(simd, &[8, 9, 10, 11, 12, 13, 14, 15]);
-            assert_eq!(shr1(a, b).as_slice(), &[15, 0, 1, 2, 3, 4, 5, 6]);
-            assert_eq!(shr2(a, b).as_slice(), &[14, 15, 0, 1, 2, 3, 4, 5]);
-        });
+    fn vector_ops_match_scalar_at_lane_boundaries() {
+        // Lengths around multiples of `LANES` exercise the scalar fallback, the vector loops,
+        // and the partial vector tails; the offsets give disjoint, interleaved, and equal inputs.
+        let lens = [0, 1, 7, 8, 9, 15, 16, 17, 24, 25];
+        for len_l in lens {
+            for len_r in lens {
+                for offset in [0, 1, 4, 8, 64] {
+                    let lhs: Vec<u16> = (0..len_l).map(|x| 2 * x).collect();
+                    let rhs: Vec<u16> = (0..len_r).map(|x| 2 * x + offset).collect();
+                    check_all(&lhs, &rhs);
+                }
+            }
+        }
     }
 
     #[test]
