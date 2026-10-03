@@ -10,6 +10,10 @@
 //! The public functions select a SIMD level at runtime with `fearless_simd::dispatch!`, and call
 //! implementations generic over the SIMD level. Those are annotated with `#[simd]`, so that they
 //! are compiled with the matching target features enabled.
+//!
+//! The small helpers they call are `#[inline(always)]` rather than `#[simd]`: they get the target
+//! features by being inlined, and `#[simd]` does not force inlining, which can leave them out of
+//! line in the hot loops.
 
 #![cfg(feature = "simd")]
 
@@ -59,7 +63,7 @@ fn or_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binary
 
     // returns `new`, with a mask of its values which were not already written,
     // assuming that the previously written vector was `old`
-    #[simd]
+    #[inline(always)]
     fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
         // `[old[7], new[0], ..., new[6]]`
         let tmp: u16x8<S> = old.slide::<7>(new);
@@ -213,7 +217,7 @@ fn xor_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
 
     // returns the vector to write, and a mask of the values to write from it,
     // omitting repeated values assuming that previously written vector was "old"
-    #[simd]
+    #[inline(always)]
     fn handle_vector<S: Simd>(old: u16x8<S>, new: u16x8<S>) -> (u16x8<S>, u8) {
         // `[old[6], old[7], new[0], ..., new[5]]`
         let tmp1: u16x8<S> = old.slide::<6>(new);
@@ -410,7 +414,7 @@ fn sub_impl<S: Simd>(simd: S, lhs: &[u16], rhs: &[u16], visitor: &mut impl Binar
 ///
 /// ### Panics
 ///   - If `src` is shorter than `LANES`
-#[simd]
+#[inline(always)]
 fn load<S: Simd>(simd: S, src: &[u16]) -> u16x8<S> {
     u16x8::from_slice(simd, &src[..LANES])
 }
@@ -419,7 +423,7 @@ fn load<S: Simd>(simd: S, src: &[u16]) -> u16x8<S> {
 ///
 /// ### Panics
 ///   - If `out` is shorter than `LANES`
-#[simd]
+#[inline(always)]
 fn store<S: Simd>(v: u16x8<S>, out: &mut [u16]) {
     v.store_slice(&mut out[..LANES])
 }
@@ -435,7 +439,7 @@ fn store<S: Simd>(v: u16x8<S>, out: &mut [u16]) {
 /// let result = matrix_cmp_u16(a, b);
 /// assert_eq!(result.to_bitmask(), 0b0000_1010);
 /// ```
-#[simd]
+#[inline(always)]
 fn matrix_cmp_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> mask16x8<S> {
     a.simd_eq(b)
         | a.simd_eq(b.rotate_elements_left::<1>())
@@ -451,7 +455,7 @@ fn matrix_cmp_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> mask16x8<S> {
 /// Developed originally for merge sort using SIMD instructions.
 /// Standard merge. See, e.g., Inoue and Taura, SIMD- and Cache-Friendly
 /// Algorithm for Sorting an Array of Structures
-#[simd]
+#[inline(always)]
 fn simd_merge_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> [u16x8<S>; 2] {
     let mut tmp: u16x8<S> = a.min(b);
     let mut max: u16x8<S> = a.max(b);
@@ -475,7 +479,7 @@ fn simd_merge_u16<S: Simd>(a: u16x8<S>, b: u16x8<S>) -> [u16x8<S>; 2] {
 //
 // e.g. if `bitmask` is `0b0101`, then swizzle the first two bytes (the first u16 lane) to the
 // first two positions, and the 5th and 6th bytes (the third u16 lane) to the next two positions.
-#[simd]
+#[inline(always)]
 pub fn swizzle_to_front<S: Simd>(val: u16x8<S>, bitmask: u8) -> u16x8<S> {
     static SWIZZLE_TABLE: [[u8; 16]; 256] = {
         let mut table = [[0; 16]; 256];
