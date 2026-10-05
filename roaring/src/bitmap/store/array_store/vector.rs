@@ -561,11 +561,11 @@ mod x86 {
         ) -> u64 {
             const MODE: i32 = _SIDD_UWORD_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK;
             let mut found = 0;
-            for (i, a) in a[..lanes].chunks_exact(BLOCK_LANES).enumerate() {
-                let a: __m128i = u16x8::from_slice(sse4_2, a).into();
+            for (i, a) in a[..lanes].as_chunks::<BLOCK_LANES>().0.iter().enumerate() {
+                let a: __m128i = u16x8::load_array_ref(sse4_2, a).into();
                 let mut block_found = _mm_setzero_si128();
-                for b in b[..lanes].chunks_exact(BLOCK_LANES) {
-                    let b: __m128i = u16x8::from_slice(sse4_2, b).into();
+                for b in b[..lanes].as_chunks::<BLOCK_LANES>().0 {
+                    let b: __m128i = u16x8::load_array_ref(sse4_2, b).into();
                     let in_b = if may_contain_zero {
                         _mm_cmpestrm::<MODE>(b, 8, a, 8)
                     } else {
@@ -657,9 +657,9 @@ pub fn for_each_compressed_block<S: Simd, V: U16Vector<S>>(
     let mut values = [0u16; MAX_LANES];
     let values = &mut values[..V::LEN];
     v.store_slice(values);
-    for (i, block) in values.chunks_exact(BLOCK_LANES).enumerate() {
+    for (i, block) in values.as_chunks::<BLOCK_LANES>().0.iter().enumerate() {
         let block_mask = (mask >> (i * BLOCK_LANES)) as u8;
-        let block = u16x8::from_slice(v.token(), block);
+        let block = u16x8::load_array_ref(v.token(), block);
         f(swizzle_to_front(block, block_mask), block_mask.count_ones() as usize);
     }
 }
