@@ -95,6 +95,28 @@ pub(crate) struct ArrayStore {
     vec: Vec<u16>,
 }
 
+/// Returns the index of the first element of `values` which is not greater than the one before it
+fn first_not_increasing(values: &[u16]) -> Option<usize> {
+    // Only checking for an early exit once per chunk lets the comparisons within a chunk be
+    // vectorized. The scalar loop below finds the exact index.
+    const CHUNK_LEN: usize = 16;
+    let (lhs, _) = values.as_chunks::<CHUNK_LEN>();
+    let (rhs, _) = values.get(1..).unwrap_or_default().as_chunks::<CHUNK_LEN>();
+    let mut checked = 0;
+    for (lhs, rhs) in lhs.iter().zip(rhs) {
+        let mut not_increasing = false;
+        for i in 0..CHUNK_LEN {
+            not_increasing |= lhs[i] >= rhs[i];
+        }
+        if not_increasing {
+            break;
+        }
+        checked += CHUNK_LEN;
+    }
+
+    (checked + 1..values.len()).find(|&i| values[i - 1] >= values[i])
+}
+
 /// Return the first contiguous range of elements in a sorted slice.
 pub(crate) fn first_contiguous_range_len(slice: &[u16]) -> usize {
     let [first, rest @ ..] = slice else {
@@ -423,11 +445,8 @@ impl ArrayStore {
         if self.vec.len() > super::ARRAY_LIMIT as usize {
             return Err("array cardinality exceeds ARRAY_LIMIT");
         }
-        for window in self.vec.windows(2) {
-            let &[first, second] = window else { unreachable!() };
-            if first >= second {
-                return Err("array elements not strictly increasing");
-            }
+        if first_not_increasing(&self.vec).is_some() {
+            return Err("array elements not strictly increasing");
         }
 
         Ok(())
@@ -446,7 +465,7 @@ pub struct Error {
     kind: ErrorKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ErrorKind {
     Duplicate,
     OutOfOrder,
@@ -472,19 +491,15 @@ impl TryFrom<Vec<u16>> for ArrayStore {
     type Error = Error;
 
     fn try_from(value: Vec<u16>) -> Result<Self, Self::Error> {
-        let mut iter = value.iter().enumerate();
-        if let Some((_, mut prev)) = iter.next() {
-            for (i, cur) in iter {
-                match cur.cmp(prev) {
-                    Ordering::Less => return Err(Error { index: i, kind: ErrorKind::OutOfOrder }),
-                    Ordering::Equal => return Err(Error { index: i, kind: ErrorKind::Duplicate }),
-                    Ordering::Greater => (),
-                }
-                prev = cur;
-            }
-        }
-
-        Ok(ArrayStore { vec: value })
+        let Some(index) = first_not_increasing(&value) else {
+            return Ok(ArrayStore { vec: value });
+        };
+        let kind = match value[index].cmp(&value[index - 1]) {
+            Ordering::Less => ErrorKind::OutOfOrder,
+            Ordering::Equal => ErrorKind::Duplicate,
+            Ordering::Greater => unreachable!(),
+        };
+        Err(Error { index, kind })
     }
 }
 
@@ -599,6 +614,32 @@ mod tests {
             Store::Bitmap(..) => s,
             Store::Run(runs) => Store::Bitmap(runs.to_bitmap()),
         }
+    }
+
+    #[test]
+    fn test_first_not_increasing() {
+        for len in 0..40 {
+            let sorted: Vec<u16> = (0..len).map(|x| x * 3).collect();
+            assert_eq!(first_not_increasing(&sorted), None, "len {len}");
+            for i in 1..len as usize {
+                let mut duplicate = sorted.clone();
+                duplicate[i] = duplicate[i - 1];
+                assert_eq!(first_not_increasing(&duplicate), Some(i), "len {len}, dup at {i}");
+                let mut out_of_order = sorted.clone();
+                out_of_order[i] = 0;
+                assert_eq!(first_not_increasing(&out_of_order), Some(i), "len {len}, at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_try_from_reports_first_error() {
+        let err = ArrayStore::try_from(vec![1, 2, 3, 3, 2]).unwrap_err();
+        assert_eq!((err.index, &err.kind), (3, &ErrorKind::Duplicate));
+        let err = ArrayStore::try_from(vec![1, 2, 3, 2, 2]).unwrap_err();
+        assert_eq!((err.index, &err.kind), (3, &ErrorKind::OutOfOrder));
+        assert!(ArrayStore::try_from(vec![]).is_ok());
+        assert!(ArrayStore::try_from(vec![u16::MAX]).is_ok());
     }
 
     #[test]
