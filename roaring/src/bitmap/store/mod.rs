@@ -219,7 +219,7 @@ impl Store {
             (Bitmap(bits1), Bitmap(bits2)) => bits1.is_subset(bits2),
             (Array(vec), Bitmap(bits)) => vec.iter().all(|&i| bits.contains(i)),
             (Bitmap(..), &Array(..)) => false,
-            (Array(vec), Run(runs)) => vec.iter().all(|&i| runs.contains(i)),
+            (Array(vec), Run(runs)) => runs.is_superset_array(vec),
             (Bitmap(bitmap), Run(runs)) => bitmap.iter().all(|i| runs.contains(i)),
             (Run(intervals1), Run(intervals2)) => intervals1.is_subset(intervals2),
             (Run(intervals), Array(vec)) => intervals.is_subset_array(vec),
@@ -647,10 +647,10 @@ impl BitAndAssign<&Store> for Store {
             (this @ Run(..), Array(array)) => {
                 let Run(runs) = &this else { unreachable!() };
                 let mut new_array = array.clone();
-                new_array.retain(|f| runs.contains(f));
+                BitAndAssign::bitand_assign(&mut new_array, runs);
                 *this = Array(new_array);
             }
-            (Array(array), Run(runs)) => array.retain(|f| runs.contains(f)),
+            (Array(array), Run(runs)) => BitAndAssign::bitand_assign(array, runs),
         }
     }
 }
@@ -693,11 +693,7 @@ impl SubAssign<&Store> for Store {
                     runs.remove(f);
                 });
             }
-            (Array(array), Run(runs)) => {
-                runs.iter_intervals().for_each(|iv| {
-                    array.remove_range(iv.start()..=iv.end());
-                });
-            }
+            (Array(array), Run(runs)) => SubAssign::sub_assign(array, runs),
             (this @ Run(..), Bitmap(bitmap)) => {
                 let Run(runs) = &this else { unreachable!() };
                 let mut new_bitmap = runs.to_bitmap();

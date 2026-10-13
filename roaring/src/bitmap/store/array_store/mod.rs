@@ -7,9 +7,10 @@ use crate::bitmap::store::array_store::visitor::{
 };
 use core::cmp::Ordering;
 use core::cmp::Ordering::*;
+use core::convert::Infallible;
 use core::fmt::{Display, Formatter};
 use core::mem::size_of;
-use core::ops::{BitAnd, BitAndAssign, BitOr, BitXor, RangeInclusive, Sub, SubAssign};
+use core::ops::{BitAnd, BitAndAssign, BitOr, BitXor, ControlFlow, RangeInclusive, Sub, SubAssign};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -18,7 +19,8 @@ use alloc::vec::Vec;
 use alloc::boxed::Box;
 
 use super::bitmap_store::{bit, key, BitmapStore, BITMAP_LENGTH};
-use super::Interval;
+use super::interval_store::{for_each_run_overlap, is_sparse_array};
+use super::{Interval, IntervalStore};
 
 pub(crate) const ARRAY_ELEMENT_BYTES: usize = 2;
 
@@ -546,6 +548,45 @@ impl BitAndAssign<&Self> for ArrayStore {
 impl BitAndAssign<&BitmapStore> for ArrayStore {
     fn bitand_assign(&mut self, rhs: &BitmapStore) {
         self.retain(|x| rhs.contains(x));
+    }
+}
+
+impl BitAndAssign<&IntervalStore> for ArrayStore {
+    fn bitand_assign(&mut self, rhs: &IntervalStore) {
+        if is_sparse_array(rhs, &self.vec) {
+            self.retain(|f| rhs.contains(f));
+            return;
+        }
+        let mut len = 0;
+        let ControlFlow::Continue(()) =
+            for_each_run_overlap::<_, Infallible>(rhs, &mut self.vec, |vec, overlap| {
+                let overlap_len = overlap.len();
+                vec.copy_within(overlap, len);
+                len += overlap_len;
+                ControlFlow::Continue(())
+            });
+        self.vec.truncate(len);
+    }
+}
+
+impl SubAssign<&IntervalStore> for ArrayStore {
+    fn sub_assign(&mut self, rhs: &IntervalStore) {
+        if is_sparse_array(rhs, &self.vec) {
+            self.retain(|f| !rhs.contains(f));
+            return;
+        }
+        let mut len = 0;
+        let mut kept_from = 0;
+        let ControlFlow::Continue(()) =
+            for_each_run_overlap::<_, Infallible>(rhs, &mut self.vec, |vec, overlap| {
+                vec.copy_within(kept_from..overlap.start, len);
+                len += overlap.start - kept_from;
+                kept_from = overlap.end;
+                ControlFlow::Continue(())
+            });
+        let vec_len = self.vec.len();
+        self.vec.copy_within(kept_from..vec_len, len);
+        self.vec.truncate(len + vec_len - kept_from);
     }
 }
 

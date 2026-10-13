@@ -1,11 +1,11 @@
 use alloc::vec::Vec;
-use core::ops::{
-    BitAnd, BitAndAssign, BitOrAssign, BitXor, BitXorAssign, RangeInclusive, SubAssign,
-};
+use core::convert::Infallible;
+use core::ops::{BitAnd, BitOrAssign, BitXor, BitXorAssign, RangeInclusive, SubAssign};
 use core::slice::Iter;
-use core::{cmp::Ordering, ops::ControlFlow};
+use core::{cmp::Ordering, ops::ControlFlow, ops::Deref, ops::Range};
 
 use super::{ArrayStore, BitmapStore};
+use crate::bitmap::util::gallop;
 
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub(crate) struct IntervalStore(Vec<Interval>);
@@ -377,7 +377,27 @@ impl IntervalStore {
     }
 
     pub(crate) fn is_disjoint_array(&self, array: &ArrayStore) -> bool {
-        array.iter().all(|&i| !self.contains(i))
+        if is_sparse_array(self, array.as_slice()) {
+            return array.iter().all(|&i| !self.contains(i));
+        }
+        for_each_run_overlap(self, &mut array.as_slice(), |_, _| ControlFlow::Break(()))
+            .is_continue()
+    }
+
+    /// Returns true if every element of `array` is in one of these runs
+    pub(crate) fn is_superset_array(&self, array: &ArrayStore) -> bool {
+        if is_sparse_array(self, array.as_slice()) {
+            return array.iter().all(|&i| self.contains(i));
+        }
+        let mut covered = 0;
+        let flow = for_each_run_overlap(self, &mut array.as_slice(), |_, overlap| {
+            if overlap.start != covered {
+                return ControlFlow::Break(());
+            }
+            covered = overlap.end;
+            ControlFlow::Continue(())
+        });
+        flow.is_continue() && covered == array.as_slice().len()
     }
 
     pub(crate) fn is_disjoint_bitmap(&self, array: &BitmapStore) -> bool {
@@ -416,7 +436,16 @@ impl IntervalStore {
     }
 
     pub(crate) fn intersection_len_array(&self, other: &ArrayStore) -> u64 {
-        other.iter().map(|&f| self.contains(f) as u64).sum()
+        if is_sparse_array(self, other.as_slice()) {
+            return other.iter().map(|&f| self.contains(f) as u64).sum();
+        }
+        let mut len = 0;
+        let ControlFlow::Continue(()) =
+            for_each_run_overlap::<_, Infallible>(self, &mut other.as_slice(), |_, overlap| {
+                len += overlap.len() as u64;
+                ControlFlow::Continue(())
+            });
+        len
     }
 
     pub fn len(&self) -> u64 {
@@ -572,10 +601,41 @@ impl BitAnd for &IntervalStore {
     }
 }
 
-impl BitAndAssign<&IntervalStore> for ArrayStore {
-    fn bitand_assign(&mut self, rhs: &IntervalStore) {
-        self.retain(|f| rhs.contains(f));
+/// Returns true if there are so many more runs than array elements that it is faster to binary
+/// search the runs for each array element than to use [`for_each_run_overlap`]
+///
+/// The binary searches are independent, so they can run in parallel.
+pub(crate) fn is_sparse_array(runs: &IntervalStore, array: &[u16]) -> bool {
+    const RATIO: usize = 8;
+    array.len() * RATIO < runs.0.len()
+}
+
+/// Calls `f` with the range of the indices of the elements of `array` within each run that
+/// contains any, in order, until `f` breaks
+///
+/// This gallops through both `runs` and `array`. `f` is passed `array`, so that it can modify the
+/// elements before the start of the range.
+pub(crate) fn for_each_run_overlap<A: Deref<Target = [u16]>, B>(
+    runs: &IntervalStore,
+    array: &mut A,
+    mut f: impl FnMut(&mut A, Range<usize>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    let mut runs = runs.0.as_slice();
+    let mut offset = 0;
+    while let [run, ..] = runs {
+        offset += gallop(&array[offset..], |&value| value < run.start);
+        let Some(&first) = array.get(offset) else { break };
+        let skipped = gallop(runs, |run| run.end < first);
+        if skipped > 0 {
+            runs = &runs[skipped..];
+            continue;
+        }
+        let len = gallop(&array[offset..], |&value| value <= run.end);
+        f(array, offset..offset + len)?;
+        offset += len;
+        runs = &runs[1..];
     }
+    ControlFlow::Continue(())
 }
 
 impl SubAssign<&Self> for IntervalStore {
@@ -981,6 +1041,82 @@ impl Interval {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// Builds runs from consecutive pairs of `bounds`, skipping those which would touch the
+    /// previous run
+    fn runs_from_bounds(bounds: impl IntoIterator<Item = u16>) -> IntervalStore {
+        let bounds = Vec::from_iter(bounds);
+        let mut runs: Vec<Interval> = Vec::new();
+        for &[start, end] in bounds.as_chunks::<2>().0 {
+            if runs.last().is_some_and(|last| u32::from(last.end) + 1 >= u32::from(start)) {
+                continue;
+            }
+            runs.push(Interval::new_unchecked(start, end));
+        }
+        IntervalStore(runs)
+    }
+
+    fn check_array_run_ops(runs: &IntervalStore, array: Vec<u16>) {
+        let array = ArrayStore::from_vec_unchecked(array);
+        let mut inside = Vec::new();
+        let mut outside = Vec::new();
+        for &value in array.iter() {
+            if runs.contains(value) {
+                inside.push(value);
+            } else {
+                outside.push(value);
+            }
+        }
+        assert_eq!(runs.intersection_len_array(&array), inside.len() as u64);
+        assert_eq!(runs.is_disjoint_array(&array), inside.is_empty());
+        assert_eq!(runs.is_superset_array(&array), outside.is_empty());
+        let mut and = array.clone();
+        and &= runs;
+        assert_eq!(and.as_slice(), inside);
+        let mut sub = array.clone();
+        sub -= runs;
+        assert_eq!(sub.as_slice(), outside);
+    }
+
+    proptest! {
+        #[test]
+        fn array_run_ops_match_contains_dense(
+            bounds in prop::collection::btree_set(0u16..512, 0..64),
+            array in prop::collection::btree_set(0u16..512, 0..128),
+        ) {
+            check_array_run_ops(&runs_from_bounds(bounds), Vec::from_iter(array));
+        }
+
+        #[test]
+        fn array_run_ops_match_contains_sparse(
+            bounds in prop::collection::btree_set(any::<u16>(), 0..256),
+            array in prop::collection::btree_set(any::<u16>(), 0..256),
+        ) {
+            check_array_run_ops(&runs_from_bounds(bounds), Vec::from_iter(array));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn array_run_ops_match_contains_with_many_more_runs(
+            bounds in prop::collection::btree_set(any::<u16>(), 256..1024),
+            array in prop::collection::btree_set(any::<u16>(), 0..8),
+        ) {
+            check_array_run_ops(&runs_from_bounds(bounds), Vec::from_iter(array));
+        }
+    }
+
+    #[test]
+    fn array_run_ops_at_edges() {
+        let runs = runs_from_bounds([0, 0, 10, 20, 100, 100, u16::MAX - 1, u16::MAX]);
+        check_array_run_ops(&runs, vec![]);
+        check_array_run_ops(&runs, vec![0, 10, 20, 100, u16::MAX]);
+        check_array_run_ops(&runs, vec![1, 9, 21, 99, 101, u16::MAX - 2]);
+        check_array_run_ops(&runs, (0..=u16::MAX).step_by(7).collect());
+        check_array_run_ops(&IntervalStore::new(), vec![1, 2, 3]);
+        check_array_run_ops(&IntervalStore::full(), vec![0, 1, u16::MAX]);
+    }
 
     #[test]
     fn insert_empty() {

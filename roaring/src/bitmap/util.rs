@@ -14,6 +14,29 @@ pub fn join(high: u16, low: u16) -> u32 {
     (u32::from(high) << 16) + u32::from(low)
 }
 
+/// Like [`slice::partition_point`], but faster when the partition point is near the start of
+/// `slice`
+///
+/// Probes at exponentially increasing offsets before binary searching the last gap.
+#[inline]
+pub fn gallop<T>(slice: &[T], mut pred: impl FnMut(&T) -> bool) -> usize {
+    if slice.first().is_none_or(|first| !pred(first)) {
+        return 0;
+    }
+    // invariant: `pred(&slice[lo])`
+    let mut lo = 0;
+    let mut step = 1;
+    loop {
+        let hi = lo + step;
+        if hi >= slice.len() || !pred(&slice[hi]) {
+            let hi = hi.min(slice.len());
+            return lo + 1 + slice[lo + 1..hi].partition_point(pred);
+        }
+        lo = hi;
+        step *= 2;
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ConvertRangeError {
     Empty,
@@ -63,8 +86,21 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{convert_range_to_inclusive, join, split, ConvertRangeError};
+    use super::{convert_range_to_inclusive, gallop, join, split, ConvertRangeError};
+    use alloc::vec::Vec;
     use core::ops::Bound;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn gallop_matches_partition_point(
+            slice in prop::collection::btree_set(any::<u16>(), 0..300),
+            value in any::<u16>(),
+        ) {
+            let slice = Vec::from_iter(slice);
+            prop_assert_eq!(gallop(&slice, |&x| x < value), slice.partition_point(|&x| x < value));
+        }
+    }
 
     #[test]
     fn test_split_u32() {

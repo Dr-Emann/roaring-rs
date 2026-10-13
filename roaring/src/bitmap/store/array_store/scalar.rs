@@ -1,6 +1,7 @@
 //! Scalar arithmetic binary set operations on `ArrayStore`'s inner types
 
 use crate::bitmap::store::array_store::visitor::BinaryOperationVisitor;
+use crate::bitmap::util::gallop;
 use core::cmp::Ordering::*;
 
 #[inline]
@@ -108,26 +109,9 @@ pub fn xor(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) 
 }
 
 /// Returns the index of the first element of `slice` which is not less than `value`
-///
-/// Probes at exponentially increasing offsets before binary searching the last gap, so this is
-/// fast when that element is near the start of `slice`.
 #[inline]
-pub fn advance_until(slice: &[u16], value: u16) -> usize {
-    if slice.first().is_none_or(|&first| first >= value) {
-        return 0;
-    }
-    // invariant: `slice[lo] < value`
-    let mut lo = 0;
-    let mut step = 1;
-    loop {
-        let hi = lo + step;
-        if hi >= slice.len() || slice[hi] >= value {
-            let hi = hi.min(slice.len());
-            return lo + 1 + slice[lo + 1..hi].partition_point(|&x| x < value);
-        }
-        lo = hi;
-        step *= 2;
-    }
+fn advance_until(slice: &[u16], value: u16) -> usize {
+    gallop(slice, |&x| x < value)
 }
 
 /// Like [`and`], for when `small` is much shorter than `large`
@@ -268,15 +252,6 @@ mod test {
     }
 
     proptest! {
-        #[test]
-        fn advance_until_matches_partition_point(
-            slice in prop::collection::btree_set(any::<u16>(), 0..300),
-            value in any::<u16>(),
-        ) {
-            let slice = Vec::from_iter(slice);
-            prop_assert_eq!(advance_until(&slice, value), slice.partition_point(|&x| x < value));
-        }
-
         #[test]
         fn skewed_ops_match_merges_dense(
             small in prop::collection::btree_set(0u16..2048, 0..16),
