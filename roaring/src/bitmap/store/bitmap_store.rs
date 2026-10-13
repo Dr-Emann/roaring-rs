@@ -4,6 +4,7 @@ use core::fmt::{Display, Formatter};
 use core::mem::size_of;
 use core::ops::{BitAndAssign, BitOrAssign, BitXorAssign, RangeInclusive, SubAssign};
 
+use super::simd::with_simd_features;
 use super::{ArrayStore, Interval};
 
 #[cfg(not(feature = "std"))]
@@ -31,7 +32,7 @@ impl BitmapStore {
     }
 
     pub fn try_from(len: u64, bits: Box<[u64; BITMAP_LENGTH]>) -> Result<BitmapStore, Error> {
-        let actual_len = bits.iter().map(|v| v.count_ones() as u64).sum();
+        let actual_len = count_ones(&bits[..]);
         if len != actual_len {
             Err(Error { kind: ErrorKind::Cardinality { expected: len, actual: actual_len } })
         } else {
@@ -311,8 +312,7 @@ impl BitmapStore {
     pub fn rank(&self, index: u16) -> u64 {
         let (key, bit) = (key(index), bit(index));
 
-        self.bits[..key].iter().map(|v| v.count_ones() as u64).sum::<u64>()
-            + (self.bits[key] << (63 - bit)).count_ones() as u64
+        count_ones(&self.bits[..key]) + (self.bits[key] << (63 - bit)).count_ones() as u64
     }
 
     pub fn select(&self, n: u16) -> Option<u16> {
@@ -331,7 +331,16 @@ impl BitmapStore {
     }
 
     pub fn intersection_len_bitmap(&self, other: &BitmapStore) -> u64 {
-        self.bits.iter().zip(other.bits.iter()).map(|(&a, &b)| (a & b).count_ones() as u64).sum()
+        with_simd_features(
+            #[inline(always)]
+            || {
+                let mut len = 0;
+                for (&a, &b) in self.bits.iter().zip(other.bits.iter()) {
+                    len += (a & b).count_ones() as u64;
+                }
+                len
+            },
+        )
     }
 
     pub(crate) fn intersection_len_interval(&self, interval: &Interval) -> u64 {
@@ -429,7 +438,7 @@ impl BitmapStore {
     }
 
     pub(crate) fn internal_validate(&self) -> Result<(), &'static str> {
-        let expected_len: u64 = self.bits.iter().map(|bits| u64::from(bits.count_ones())).sum();
+        let expected_len = count_ones(&self.bits[..]);
         if self.len != expected_len {
             return Err("bitmap cardinality is incorrect");
         }
@@ -851,11 +860,42 @@ fn all_words_zero(
 
 #[inline]
 fn op_bitmaps(bits1: &mut BitmapStore, bits2: &BitmapStore, op: impl Fn(&mut u64, u64)) {
-    bits1.len = 0;
-    for (index1, &index2) in bits1.bits.iter_mut().zip(bits2.bits.iter()) {
-        op(index1, index2);
-        bits1.len += index1.count_ones() as u64;
+    // Accumulating into a field of `bits1`, through the closure's capture, stops the loop from
+    // being vectorized: pass the words as separate references instead.
+    #[inline(always)]
+    fn op_words(
+        words1: &mut [u64; BITMAP_LENGTH],
+        words2: &[u64; BITMAP_LENGTH],
+        op: impl Fn(&mut u64, u64),
+    ) -> u64 {
+        let mut len = 0;
+        for (word1, &word2) in words1.iter_mut().zip(words2.iter()) {
+            op(word1, word2);
+            len += word1.count_ones() as u64;
+        }
+        len
     }
+
+    let BitmapStore { len, bits } = bits1;
+    *len = with_simd_features(
+        #[inline(always)]
+        || op_words(bits, &bits2.bits, op),
+    );
+}
+
+/// Returns the number of bits set in `words`
+#[inline]
+fn count_ones(words: &[u64]) -> u64 {
+    with_simd_features(
+        #[inline(always)]
+        || {
+            let mut len = 0;
+            for word in words {
+                len += word.count_ones() as u64;
+            }
+            len
+        },
+    )
 }
 
 impl BitOrAssign<&Self> for BitmapStore {

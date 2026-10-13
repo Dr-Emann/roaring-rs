@@ -1,6 +1,7 @@
 mod array_store;
 mod bitmap_store;
 mod interval_store;
+mod simd;
 
 use alloc::vec;
 use core::mem;
@@ -20,6 +21,7 @@ pub(crate) use interval_store::{IntervalStore, RunIterBorrowed, RunIterOwned};
 pub(crate) use interval_store::{RUN_ELEMENT_BYTES, RUN_NUM_BYTES};
 
 use crate::bitmap::container::ARRAY_LIMIT;
+use simd::with_simd_features;
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -302,20 +304,23 @@ impl Store {
                     })
                     .1
             }
-            Bitmap(bits) => {
-                let mut num_runs = 0u64;
+            Bitmap(bits) => with_simd_features(
+                #[inline(always)]
+                || {
+                    let mut num_runs = 0u64;
 
-                for i in 0..BITMAP_LENGTH - 1 {
-                    let word = bits.as_array()[i];
-                    let next_word = bits.as_array()[i + 1];
-                    num_runs +=
-                        ((word << 1) & !word).count_ones() as u64 + ((word >> 63) & !next_word);
-                }
+                    for i in 0..BITMAP_LENGTH - 1 {
+                        let word = bits.as_array()[i];
+                        let next_word = bits.as_array()[i + 1];
+                        num_runs +=
+                            ((word << 1) & !word).count_ones() as u64 + ((word >> 63) & !next_word);
+                    }
 
-                let last = bits.as_array()[BITMAP_LENGTH - 1];
-                num_runs += ((last << 1) & !last).count_ones() as u64 + (last >> 63);
-                num_runs
-            }
+                    let last = bits.as_array()[BITMAP_LENGTH - 1];
+                    num_runs += ((last << 1) & !last).count_ones() as u64 + (last >> 63);
+                    num_runs
+                },
+            ),
             Run(intervals) => intervals.run_amount(),
         }
     }
