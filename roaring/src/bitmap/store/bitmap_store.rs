@@ -264,11 +264,11 @@ impl BitmapStore {
     }
 
     pub fn is_disjoint(&self, other: &BitmapStore) -> bool {
-        self.bits.iter().zip(other.bits.iter()).all(|(&i1, &i2)| (i1 & i2) == 0)
+        all_words_zero(&self.bits, &other.bits, |lhs, rhs| lhs & rhs)
     }
 
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.bits.iter().zip(other.bits.iter()).all(|(&i1, &i2)| (i1 & i2) == i1)
+        all_words_zero(&self.bits, &other.bits, |lhs, rhs| lhs & !rhs)
     }
 
     pub(crate) fn to_array_store(&self) -> ArrayStore {
@@ -820,6 +820,33 @@ pub fn key(index: u16) -> usize {
 #[inline]
 pub fn bit(index: u16) -> usize {
     index as usize % 64
+}
+
+/// Returns true if `op` returns zero for every pair of corresponding words of `lhs` and `rhs`
+///
+/// This only checks for an early exit once per chunk of words, which lets the words within a
+/// chunk be combined with vector instructions.
+#[inline]
+fn all_words_zero(
+    lhs: &[u64; BITMAP_LENGTH],
+    rhs: &[u64; BITMAP_LENGTH],
+    op: impl Fn(u64, u64) -> u64,
+) -> bool {
+    const CHUNK_WORDS: usize = 16;
+    const { assert!(BITMAP_LENGTH.is_multiple_of(CHUNK_WORDS)) }
+
+    let (lhs, _) = lhs.as_chunks::<CHUNK_WORDS>();
+    let (rhs, _) = rhs.as_chunks::<CHUNK_WORDS>();
+    for (lhs, rhs) in lhs.iter().zip(rhs) {
+        let mut any = 0;
+        for i in 0..CHUNK_WORDS {
+            any |= op(lhs[i], rhs[i]);
+        }
+        if any != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[inline]
