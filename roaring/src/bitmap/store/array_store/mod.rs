@@ -2,7 +2,9 @@ mod scalar;
 mod vector;
 mod visitor;
 
-use crate::bitmap::store::array_store::visitor::{CardinalityCounter, VecWriter};
+use crate::bitmap::store::array_store::visitor::{
+    BinaryOperationVisitor, CardinalityCounter, VecWriter,
+};
 use core::cmp::Ordering;
 use core::cmp::Ordering::*;
 use core::fmt::{Display, Formatter};
@@ -19,6 +21,74 @@ use super::bitmap_store::{bit, key, BitmapStore, BITMAP_LENGTH};
 use super::Interval;
 
 pub(crate) const ARRAY_ELEMENT_BYTES: usize = 2;
+
+/// Arrays whose lengths differ by more than this factor are combined by searching the longer array
+/// for each element of the shorter one, rather than by merging them
+const SKEWED_LEN_RATIO: usize = 64;
+
+fn is_skewed(small: &[u16], large: &[u16]) -> bool {
+    small.len() * SKEWED_LEN_RATIO < large.len()
+}
+
+#[cfg(not(feature = "simd"))]
+fn is_skewed_either_way(lhs: &[u16], rhs: &[u16]) -> bool {
+    let (small, large) = shorter_first(lhs, rhs);
+    is_skewed(small, large)
+}
+
+fn shorter_first<'a>(lhs: &'a [u16], rhs: &'a [u16]) -> (&'a [u16], &'a [u16]) {
+    if lhs.len() <= rhs.len() {
+        (lhs, rhs)
+    } else {
+        (rhs, lhs)
+    }
+}
+
+fn or(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
+    let (small, large) = shorter_first(lhs, rhs);
+    if is_skewed(small, large) {
+        return scalar::or_skewed(small, large, visitor);
+    }
+    #[cfg(feature = "simd")]
+    vector::or(lhs, rhs, visitor);
+    #[cfg(not(feature = "simd"))]
+    scalar::or(lhs, rhs, visitor);
+}
+
+fn and(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
+    let (small, large) = shorter_first(lhs, rhs);
+    if is_skewed(small, large) {
+        return scalar::and_skewed(small, large, visitor);
+    }
+    #[cfg(feature = "simd")]
+    vector::and(lhs, rhs, visitor);
+    #[cfg(not(feature = "simd"))]
+    scalar::and(lhs, rhs, visitor);
+}
+
+fn sub(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
+    if is_skewed(lhs, rhs) {
+        return scalar::sub_skewed_small_lhs(lhs, rhs, visitor);
+    }
+    if is_skewed(rhs, lhs) {
+        return scalar::sub_skewed_small_rhs(lhs, rhs, visitor);
+    }
+    #[cfg(feature = "simd")]
+    vector::sub(lhs, rhs, visitor);
+    #[cfg(not(feature = "simd"))]
+    scalar::sub(lhs, rhs, visitor);
+}
+
+fn xor(lhs: &[u16], rhs: &[u16], visitor: &mut impl BinaryOperationVisitor) {
+    let (small, large) = shorter_first(lhs, rhs);
+    if is_skewed(small, large) {
+        return scalar::xor_skewed(small, large, visitor);
+    }
+    #[cfg(feature = "simd")]
+    vector::xor(lhs, rhs, visitor);
+    #[cfg(not(feature = "simd"))]
+    scalar::xor(lhs, rhs, visitor);
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ArrayStore {
@@ -223,6 +293,10 @@ impl ArrayStore {
     }
 
     pub fn is_disjoint(&self, other: &Self) -> bool {
+        let (small, large) = shorter_first(self.as_slice(), other.as_slice());
+        if is_skewed(small, large) {
+            return scalar::is_disjoint_skewed(small, large);
+        }
         let (mut i1, mut i2) = (self.vec.iter(), other.vec.iter());
         let (mut value1, mut value2) = (i1.next(), i2.next());
         loop {
@@ -236,6 +310,12 @@ impl ArrayStore {
     }
 
     pub fn is_subset(&self, other: &Self) -> bool {
+        if self.len() > other.len() {
+            return false;
+        }
+        if is_skewed(self.as_slice(), other.as_slice()) {
+            return scalar::is_subset_skewed(self.as_slice(), other.as_slice());
+        }
         let (mut i1, mut i2) = (self.iter(), other.iter());
         let (mut value1, mut value2) = (i1.next(), i2.next());
         loop {
@@ -256,10 +336,7 @@ impl ArrayStore {
 
     pub fn intersection_len(&self, other: &Self) -> u64 {
         let mut visitor = CardinalityCounter::new();
-        #[cfg(feature = "simd")]
-        vector::and(self.as_slice(), other.as_slice(), &mut visitor);
-        #[cfg(not(feature = "simd"))]
-        scalar::and(self.as_slice(), other.as_slice(), &mut visitor);
+        and(self.as_slice(), other.as_slice(), &mut visitor);
         visitor.into_inner()
     }
 
@@ -418,10 +495,7 @@ impl BitOr<Self> for &ArrayStore {
         #[allow(clippy::suspicious_arithmetic_impl)]
         let capacity = self.vec.len() + rhs.vec.len();
         let mut visitor = VecWriter::new(capacity);
-        #[cfg(feature = "simd")]
-        vector::or(self.as_slice(), rhs.as_slice(), &mut visitor);
-        #[cfg(not(feature = "simd"))]
-        scalar::or(self.as_slice(), rhs.as_slice(), &mut visitor);
+        or(self.as_slice(), rhs.as_slice(), &mut visitor);
         ArrayStore::from_vec_unchecked(visitor.into_inner())
     }
 }
@@ -431,10 +505,7 @@ impl BitAnd<Self> for &ArrayStore {
 
     fn bitand(self, rhs: Self) -> Self::Output {
         let mut visitor = VecWriter::new(self.vec.len().min(rhs.vec.len()));
-        #[cfg(feature = "simd")]
-        vector::and(self.as_slice(), rhs.as_slice(), &mut visitor);
-        #[cfg(not(feature = "simd"))]
-        scalar::and(self.as_slice(), rhs.as_slice(), &mut visitor);
+        and(self.as_slice(), rhs.as_slice(), &mut visitor);
         ArrayStore::from_vec_unchecked(visitor.into_inner())
     }
 }
@@ -442,20 +513,18 @@ impl BitAnd<Self> for &ArrayStore {
 impl BitAndAssign<&Self> for ArrayStore {
     #[allow(clippy::suspicious_op_assign_impl)]
     fn bitand_assign(&mut self, rhs: &Self) {
-        #[cfg(feature = "simd")]
-        {
-            let mut visitor = VecWriter::new(self.vec.len().min(rhs.vec.len()));
-            vector::and(self.as_slice(), rhs.as_slice(), &mut visitor);
-            self.vec = visitor.into_inner()
-        }
         #[cfg(not(feature = "simd"))]
-        {
+        if !is_skewed_either_way(self.as_slice(), rhs.as_slice()) {
             let mut i = 0;
             self.retain(|x| {
                 i += rhs.iter().skip(i).position(|y| *y >= x).unwrap_or(rhs.vec.len());
                 rhs.vec.get(i).is_some_and(|y| x == *y)
             });
+            return;
         }
+        let mut visitor = VecWriter::new(self.vec.len().min(rhs.vec.len()));
+        and(self.as_slice(), rhs.as_slice(), &mut visitor);
+        self.vec = visitor.into_inner()
     }
 }
 
@@ -470,10 +539,7 @@ impl Sub<Self> for &ArrayStore {
 
     fn sub(self, rhs: Self) -> Self::Output {
         let mut visitor = VecWriter::new(self.vec.len());
-        #[cfg(feature = "simd")]
-        vector::sub(self.as_slice(), rhs.as_slice(), &mut visitor);
-        #[cfg(not(feature = "simd"))]
-        scalar::sub(self.as_slice(), rhs.as_slice(), &mut visitor);
+        sub(self.as_slice(), rhs.as_slice(), &mut visitor);
         ArrayStore::from_vec_unchecked(visitor.into_inner())
     }
 }
@@ -481,20 +547,18 @@ impl Sub<Self> for &ArrayStore {
 impl SubAssign<&Self> for ArrayStore {
     #[allow(clippy::suspicious_op_assign_impl)]
     fn sub_assign(&mut self, rhs: &Self) {
-        #[cfg(feature = "simd")]
-        {
-            let mut visitor = VecWriter::new(self.vec.len().min(rhs.vec.len()));
-            vector::sub(self.as_slice(), rhs.as_slice(), &mut visitor);
-            self.vec = visitor.into_inner()
-        }
         #[cfg(not(feature = "simd"))]
-        {
+        if !is_skewed_either_way(self.as_slice(), rhs.as_slice()) {
             let mut i = 0;
             self.retain(|x| {
                 i += rhs.iter().skip(i).position(|y| *y >= x).unwrap_or(rhs.vec.len());
                 rhs.vec.get(i).is_none_or(|y| x != *y)
             });
+            return;
         }
+        let mut visitor = VecWriter::new(self.vec.len());
+        sub(self.as_slice(), rhs.as_slice(), &mut visitor);
+        self.vec = visitor.into_inner()
     }
 }
 
@@ -511,10 +575,7 @@ impl BitXor<Self> for &ArrayStore {
         #[allow(clippy::suspicious_arithmetic_impl)]
         let capacity = self.vec.len() + rhs.vec.len();
         let mut visitor = VecWriter::new(capacity);
-        #[cfg(feature = "simd")]
-        vector::xor(self.as_slice(), rhs.as_slice(), &mut visitor);
-        #[cfg(not(feature = "simd"))]
-        scalar::xor(self.as_slice(), rhs.as_slice(), &mut visitor);
+        xor(self.as_slice(), rhs.as_slice(), &mut visitor);
         ArrayStore::from_vec_unchecked(visitor.into_inner())
     }
 }
