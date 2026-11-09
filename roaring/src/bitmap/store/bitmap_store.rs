@@ -38,7 +38,7 @@ impl BitmapStore {
     }
 
     pub fn try_from(len: u64, bits: Box<[u64; BITMAP_LENGTH]>) -> Result<BitmapStore, Error> {
-        let actual_len = bits.iter().map(|v| v.count_ones() as u64).sum();
+        let actual_len = dispatch!(level(), simd => count_bits(simd, &bits));
         if len != actual_len {
             Err(Error { kind: ErrorKind::Cardinality { expected: len, actual: actual_len } })
         } else {
@@ -468,8 +468,105 @@ impl BitmapStore {
     }
 }
 
+/// A bitwise carry-save adder
+///
+/// Treats each item as a collection of one bit lanes, adds the lanes together (maximum of 3 total)
+/// Returns the high cary bits, stores the low bits back into the first argument.
+///
+/// The sum of the popcount of a, b, and c is equal 2*popcount(res.0) + popcount(res.1)
+#[inline(always)]
+fn csa<S: Simd, V: SimdInt<S>>(a: &mut V, b: V, c: V) -> V {
+    let u = *a ^ b;
+    let carry = (*a & b) | (u & c);
+    *a = u ^ c;
+    carry
+}
+
+#[inline(always)]
+fn harley_seal_popcount<S: Simd>(simd: S, bits: &[u64; BITMAP_LENGTH]) -> u64 {
+    let [mut ones, mut twos, mut fours, mut eights] = [S::u64s::splat(simd, 0); _];
+    let mut total = S::u64s::splat(simd, 0);
+    let mut mega_chunks = bits.chunks_exact(16 * S::u64s::LEN);
+    for mega_chunk in &mut mega_chunks {
+        let chunks = mega_chunk.chunks_exact(S::u64s::LEN);
+        assert!(chunks.remainder().is_empty());
+        let mut chunks = chunks.map(|chunk| S::u64s::from_slice(simd, chunk));
+
+        let twos_a = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let twos_b = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let fours_a = csa(&mut twos, twos_a, twos_b);
+
+        let twos_a = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let twos_b = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let fours_b = csa(&mut twos, twos_a, twos_b);
+        let eights_a = csa(&mut fours, fours_a, fours_b);
+
+        let twos_a = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let twos_b = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let fours_a = csa(&mut twos, twos_a, twos_b);
+
+        let twos_a = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let twos_b = csa(&mut ones, chunks.next().unwrap(), chunks.next().unwrap());
+        let fours_b = csa(&mut twos, twos_a, twos_b);
+        let eights_b = csa(&mut fours, fours_a, fours_b);
+        let sixteens = csa(&mut eights, eights_a, eights_b);
+
+        total += sixteens.count_ones();
+    }
+
+    total <<= 4;
+    total += eights.count_ones() << 3;
+    total += fours.count_ones() << 2;
+    total += twos.count_ones() << 1;
+    total += ones.count_ones();
+
+    let mut chunks = mega_chunks.remainder().chunks_exact(S::u64s::LEN);
+    for chunk in &mut chunks {
+        total += S::u64s::from_slice(simd, chunk).count_ones();
+    }
+
+    let mut total = total.reduce_sum();
+    for word in chunks.remainder() {
+        total += u64::from(word.count_ones());
+    }
+    total
+}
+
+#[inline(always)]
+fn native_popcount<S: Simd>(simd: S, bits: &[u64; BITMAP_LENGTH]) -> u64 {
+    let mut total_acc = u16x32::splat(simd, 0);
+    let (chunks, []) = bits.as_chunks() else { unreachable!() };
+    for chunk in chunks {
+        let u16s: u16x32<S> = u64x8::load_array_ref(simd, chunk).bitcast();
+        total_acc += u16s.count_ones();
+    }
+    u64::from(total_acc.pairwise_widening_add().reduce_sum())
+}
+
+#[inline(always)]
+fn count_bits<S: Simd>(simd: S, bits: &[u64; BITMAP_LENGTH]) -> u64 {
+    #[allow(unused_mut, unused_assignments)]
+    let mut fast_native_popcount = false;
+    #[cfg(target_arch = "aarch64")]
+    {
+        fast_native_popcount = simd.level().as_neon().is_some();
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        fast_native_popcount = simd.level().as_avx512().is_some();
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        fast_native_popcount = simd.level().as_wasm_simd128().is_some();
+    }
+    if fast_native_popcount {
+        return native_popcount(simd, bits);
+    }
+    harley_seal_popcount(simd, bits)
+}
+
 // this can be done in 3 instructions on x86-64 with bmi2 with: tzcnt(pdep(1 << rank, value))
-// if n > value.count_ones() this method returns 0
+// if n > value.count_ones() this method returns 64
 fn select(mut value: u64, n: u64) -> u64 {
     // reset n of the least significant bits
     for _ in 0..n {
@@ -906,6 +1003,8 @@ fn op_bitmaps<S: Simd>(
     bits2: &BitmapStore,
     op_vec: impl Fn(u64x8<S>, u64x8<S>) -> u64x8<S>,
 ) {
+    // The popcount can overflow after 31 iterations (8 * 32 = 256), so
+    // every 16 iterations (the next lowest power of two), widen to u16s.
     const ITERATIONS_PER_WIDEN: usize = 16;
     const _: () = assert!(8 * ITERATIONS_PER_WIDEN <= u8::MAX as usize);
 
@@ -918,10 +1017,6 @@ fn op_bitmaps<S: Simd>(
     assert_eq!(lhs_chunks.len(), rhs_chunks.len());
 
     let mut len_acc = u16x32::splat(simd, 0);
-    // Iterate in nested loops:
-    // For each vector-sized chunk, perform the operation, store the result, and count the number
-    // of bits set in each byte. The popcount can overflow after 31 iterations (8 * 32 = 256), so
-    // every 16 iterations (the next lowest power of two), widen to u16s.
     for (lhs_chunks, rhs_chunks) in iter::zip(
         lhs_chunks.chunks_mut(ITERATIONS_PER_WIDEN),
         rhs_chunks.chunks(ITERATIONS_PER_WIDEN),
@@ -1007,6 +1102,7 @@ impl BitXorAssign<&ArrayStore> for BitmapStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fearless_simd::Level;
 
     #[test]
     fn test_bitmap_remove_smallest() {
@@ -1036,5 +1132,28 @@ mod tests {
             store.bits[1023],
             0b11111111111111111111111111111111111111111111111111111111111111
         );
+    }
+
+    #[test]
+    fn test_simd_popcounts() {
+        fn validate_popcounts_equal(level: Level, data: &[u64; BITMAP_LENGTH], name: &str) {
+            let expected: u64 = data.iter().map(|word| u64::from(word.count_ones())).sum();
+            let native = dispatch!(level, simd => native_popcount(simd, data));
+            let harley_seal = dispatch!(level, simd => harley_seal_popcount(simd, data));
+            assert_eq!(expected, native, "native popcount failed for {}", name);
+            assert_eq!(expected, harley_seal, "harley-seal popcount failed for {}", name);
+        }
+
+        let level = Level::try_detect().unwrap_or_else(Level::baseline);
+
+        validate_popcounts_equal(level, &[0; _], "empty");
+        validate_popcounts_equal(level, &[!0; _], "full");
+        validate_popcounts_equal(level, &[0x1; _], "bit per word");
+        validate_popcounts_equal(level, &[0x5555_5555_5555_5555; _], "odd bits");
+        validate_popcounts_equal(level, &[0xAAAA_AAAA_AAAA_AAAA; _], "even bits");
+
+        let mut only_one = [0; BITMAP_LENGTH];
+        *only_one.last_mut().unwrap() = 1;
+        validate_popcounts_equal(level, &only_one, "only one");
     }
 }

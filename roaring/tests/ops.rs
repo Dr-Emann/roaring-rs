@@ -141,3 +141,29 @@ fn xor() {
 
     assert_eq!(rb4, rb1);
 }
+
+#[test]
+fn full_container_by_ops() {
+    let full = {
+        let mut b = RoaringBitmap::new();
+        b.insert_range(0..0x1_0000);
+        b
+    };
+    let evens = RoaringBitmap::from_iter((0..0x1_0000).step_by(2));
+    let odds = RoaringBitmap::from_iter((1..0x1_0000).step_by(2));
+    assert_eq!(evens.union_len(&odds), 0x1_0000);
+    assert_eq!(evens.symmetric_difference_len(&odds), 0x1_0000);
+    assert_eq!((&evens | &odds).len(), 0x1_0000);
+    assert_eq!(&evens | &odds, full);
+
+    assert_eq!(&full & &evens, evens);
+    assert_eq!(&full | &evens, full);
+    assert_eq!(&full ^ &evens, odds);
+
+    let mut rb1 = evens.clone();
+    rb1 |= &odds;
+    assert_eq!(rb1.len(), 0x1_0000);
+    rb1 = evens.clone();
+    rb1 ^= &odds;
+    assert_eq!(rb1.len(), 0x1_0000);
+}
